@@ -82,6 +82,7 @@ void app_main(void) {
 
     // Initialize speaker component
     speaker_init();
+    speaker_update_voice_setting((uint8_t)tpms_config_get()->warning_settings);
     
     // Create speaker queue (small depth to avoid audio backlog)
     QueueHandle_t speaker_queue = xQueueCreate(1, sizeof(sensor_data_t));

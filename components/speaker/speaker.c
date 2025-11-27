@@ -20,6 +20,11 @@ static const char *TAG = "SPEAKER";
 #define PRESSURE_LOW_THRESHOLD 200
 #define PRESSURE_LEAK_THRESHOLD 230
 
+typedef enum {
+    SPEAKER_VOICE_MALE = 0,
+    SPEAKER_VOICE_FEMALE = 1
+} speaker_voice_t;
+
 // System event group bit (must match main.c definition)
 #define BIT_SPEAKER_READY (1 << 1)
 
@@ -38,10 +43,12 @@ static EventGroupHandle_t s_sensor_event_group = NULL;
 static TaskHandle_t s_all_sensors_task_handle = NULL;
 static SemaphoreHandle_t s_audio_mutex = NULL;
 static bool s_alerts_enabled = false;
+static speaker_voice_t s_active_voice = SPEAKER_VOICE_FEMALE;
 
 static EventBits_t speaker_get_sensor_bit(const char *device_name);
 static void speaker_all_sensors_task(void *pv);
 static void speaker_play_track_guarded(uint16_t track_id, uint32_t guard_time_ms);
+static uint16_t speaker_map_track_id(uint16_t female_track_id);
 
 static void send_command(uint8_t cmd, uint16_t param)
 {
@@ -148,19 +155,29 @@ void speaker_play_pressure_alert(const sensor_data_t *sensor_data)
     }
 }
 
+static uint16_t speaker_map_track_id(uint16_t female_track_id)
+{
+    if (s_active_voice == SPEAKER_VOICE_MALE &&
+        female_track_id >= 14 && female_track_id <= 26) {
+        return (uint16_t)(female_track_id - 13);
+    }
+    return female_track_id;
+}
+
 static void speaker_play_track_guarded(uint16_t track_id, uint32_t guard_time_ms)
 {
     bool locked = false;
+    uint16_t resolved_track = speaker_map_track_id(track_id);
 
     if (s_audio_mutex != NULL) {
         if (xSemaphoreTake(s_audio_mutex, portMAX_DELAY) == pdTRUE) {
             locked = true;
         } else {
-            ESP_LOGW(TAG, "Failed to obtain audio mutex, playing track %u without protection", track_id);
+            ESP_LOGW(TAG, "Failed to obtain audio mutex, playing track %u without protection", resolved_track);
         }
     }
 
-    send_command(0x03, track_id);
+    send_command(0x03, resolved_track);
 
     if (guard_time_ms > 0) {
         vTaskDelay(pdMS_TO_TICKS(guard_time_ms));
@@ -240,7 +257,13 @@ static void speaker_all_sensors_task(void *pv)
 
 void speaker_update_voice_setting(uint8_t voice)
 {
-    ESP_LOGI(TAG, "Voice setting updated to %s", voice == 0 ? "male" : "female");
+    speaker_voice_t new_voice = (voice == (uint8_t)SPEAKER_VOICE_MALE) ? SPEAKER_VOICE_MALE : SPEAKER_VOICE_FEMALE;
+    if (s_active_voice != new_voice) {
+        s_active_voice = new_voice;
+        ESP_LOGI(TAG, "Voice setting updated to %s", (new_voice == SPEAKER_VOICE_MALE) ? "male" : "female");
+    } else {
+        ESP_LOGD(TAG, "Voice setting unchanged (%s)", (new_voice == SPEAKER_VOICE_MALE) ? "male" : "female");
+    }
 }
 
 // Task xử lý DFPlayer để phát âm thanh cảnh báo

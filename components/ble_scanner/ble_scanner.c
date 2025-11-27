@@ -16,7 +16,7 @@ static const char *TAG = "BLE_SCANNER";
 // Pressure thresholds
 #define PRESSURE_HIGH_THRESHOLD 180
 #define PRESSURE_LOW_THRESHOLD 179
-#define SPEAKER_ALERT_INTERVAL_MS 10000
+#define SPEAKER_ALERT_INTERVAL_MS 8000
 
 // Global sensor data variables
 int   front_left_updated = 0;
