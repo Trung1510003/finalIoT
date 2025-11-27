@@ -1,17 +1,22 @@
 #include "ble_scanner.h"
 #include "tpms_config.h"
+#include "speaker.h"  // For speaker_notify_sensor_detected
 #include "esp_log.h"
 #include "esp_bt.h"
 #include "bt_hci_common.h"
 #include <string.h>
 #include <stdlib.h>
 #include <freertos/task.h>
+#include <freertos/semphr.h>
+#include <freertos/event_groups.h>
+#include <freertos/timers.h>
 
 static const char *TAG = "BLE_SCANNER";
 
 // Pressure thresholds
 #define PRESSURE_HIGH_THRESHOLD 180
 #define PRESSURE_LOW_THRESHOLD 179
+#define SPEAKER_ALERT_INTERVAL_MS 10000
 
 // Global sensor data variables
 int   front_left_updated = 0;
@@ -54,6 +59,25 @@ typedef struct {
 
 static uint8_t hci_cmd_buf[128];
 static QueueHandle_t s_speaker_queue = NULL;
+static TimerHandle_t s_speaker_alert_timer = NULL;
+
+// Alert throttling
+static sensor_data_t s_pending_alert = {0};
+static bool s_pending_alert_valid = false;
+static SemaphoreHandle_t s_alert_mutex = NULL;
+
+// Mutex for protecting global sensor data variables
+static SemaphoreHandle_t sensor_data_mutex = NULL;
+
+// Binary semaphore for signaling new device detection
+static SemaphoreHandle_t device_detected_sem = NULL;
+
+// Timer for BLE scan status check/restart (optional periodic check)
+static TimerHandle_t s_ble_scan_timer = NULL;
+#define BLE_SCAN_CHECK_INTERVAL_MS 30000  // Check every 30 seconds
+
+static void speaker_alert_timer_callback(TimerHandle_t xTimer);
+static void schedule_speaker_alert(const sensor_data_t *sensor_data);
 
 // Optimized address conversion
 static void address_to_string(const uint8_t *addr, char *str, size_t str_len) {
@@ -123,6 +147,71 @@ static esp_err_t get_local_name(const uint8_t *data_msg, uint8_t data_len, ble_s
     return ESP_FAIL;
 }
 
+static void schedule_speaker_alert(const sensor_data_t *sensor_data)
+{
+    if (sensor_data == NULL || s_alert_mutex == NULL || s_speaker_alert_timer == NULL) {
+        return;
+    }
+
+    if (xSemaphoreTake(s_alert_mutex, portMAX_DELAY) == pdTRUE) {
+        s_pending_alert = *sensor_data;
+        s_pending_alert_valid = true;
+        xSemaphoreGive(s_alert_mutex);
+    }
+
+    if (xTimerIsTimerActive(s_speaker_alert_timer) == pdFALSE) {
+        if (xTimerStart(s_speaker_alert_timer, 0) != pdPASS) {
+            ESP_LOGW(TAG, "Failed to start speaker alert timer");
+        } else {
+            ESP_LOGI(TAG, "Speaker alert timer armed (%d ms)", SPEAKER_ALERT_INTERVAL_MS);
+        }
+    }
+}
+
+static void speaker_alert_timer_callback(TimerHandle_t xTimer)
+{
+    (void)xTimer;
+
+    if (s_alert_mutex == NULL) {
+        return;
+    }
+
+    sensor_data_t pending = {0};
+    bool have_pending = false;
+
+    if (xSemaphoreTake(s_alert_mutex, portMAX_DELAY) == pdTRUE) {
+        if (s_pending_alert_valid) {
+            pending = s_pending_alert;
+            have_pending = true;
+        }
+        xSemaphoreGive(s_alert_mutex);
+    }
+
+    if (!have_pending) {
+        ESP_LOGD(TAG, "Alert timer fired but no pending alert");
+        return;
+    }
+
+    if (s_speaker_queue == NULL) {
+        ESP_LOGW(TAG, "Speaker queue not ready, dropping alert");
+        return;
+    }
+
+    if (xQueueSend(s_speaker_queue, &pending, 0) == pdTRUE) {
+        ESP_LOGI(TAG, "Speaker alert queued for %s", pending.device_name);
+        if (xSemaphoreTake(s_alert_mutex, portMAX_DELAY) == pdTRUE) {
+            s_pending_alert_valid = false;
+            memset(&s_pending_alert, 0, sizeof(s_pending_alert));
+            xSemaphoreGive(s_alert_mutex);
+        }
+    } else {
+        ESP_LOGW(TAG, "Speaker queue still busy, rescheduling alert");
+        if (xTimerStart(s_speaker_alert_timer, 0) != pdPASS) {
+            ESP_LOGE(TAG, "Failed to reschedule speaker alert timer");
+        }
+    }
+}
+
 static void controller_rcv_pkt_ready(void) {
     // Keep it minimal
 }
@@ -182,13 +271,23 @@ static int host_rcv_pkt(uint8_t *data, uint16_t len) {
         for (uint8_t i = 0; i < num_responses; i++) {
             ble_scan_local_name_t scanned_name = {0};
 
-            if (get_local_name(&all_data[data_msg_ptr], reports[i].data_len, &scanned_name) == ESP_OK) {
-                if (strcmp(scanned_name.scan_local_name, "AI-8000") == 0) {
-                    sensor_data_t sensor_data = parse_sensor_data(data, len, reports[i].addr);
+                    if (get_local_name(&all_data[data_msg_ptr], reports[i].data_len, &scanned_name) == ESP_OK) {
+                        if (strcmp(scanned_name.scan_local_name, "AI-8000") == 0) {
+                            sensor_data_t sensor_data = parse_sensor_data(data, len, reports[i].addr);
 
-                    ESP_LOGI(TAG, "Device: %s, Temp: %u°C, Battery: %.1f, Pressure: %u Pa",
-                             sensor_data.device_name, sensor_data.temperature,
-                             sensor_data.battery_level, sensor_data.pressure);
+                            ESP_LOGI(TAG, "Device: %s, Temp: %u°C, Battery: %.1f, Pressure: %u Pa",
+                                     sensor_data.device_name, sensor_data.temperature,
+                                     sensor_data.battery_level, sensor_data.pressure);
+                            
+                            // Notify speaker component that this sensor was detected
+                            // This will set the corresponding bit in Event Group
+                            speaker_notify_sensor_detected(sensor_data.device_name);
+                            
+                            // Signal binary semaphore for new device detection
+                            // Note: This is called from HCI callback (task context, not ISR)
+                            if (device_detected_sem != NULL) {
+                                xSemaphoreGive(device_detected_sem);
+                            }
 
                     // Pressure checking with configurable thresholds
                     bool pressure_abnormal = false;
@@ -202,39 +301,41 @@ static int host_rcv_pkt(uint8_t *data, uint16_t len) {
                         pressure_abnormal = true;
                     }
                     
-                    // Gửi dữ liệu vào speaker_queue nếu áp suất bất thường
-                    if (pressure_abnormal && s_speaker_queue != NULL) {
-                        if (xQueueSend(s_speaker_queue, &sensor_data, 0) != pdTRUE) {
-                            ESP_LOGW(TAG, "Speaker queue full, dropping audio alert for %s", sensor_data.device_name);
-                        }
+                    // Gửi dữ liệu vào speaker_queue nếu áp suất bất thường (throttled 15s)
+                    if (pressure_abnormal) {
+                        schedule_speaker_alert(&sensor_data);
                     }
 
                     // Update global variables based on device_name (assuming pressure in 0.1 PSI units)
-                    float psi = sensor_data.pressure / 10.0f;
-                    if (strcmp(sensor_data.device_name, "TT") == 0) {  // Front Left
-                        front_left_temperature = sensor_data.temperature;
-                        front_left_pressure_psi = psi;
-                        front_left_voltage = sensor_data.battery_level;
-                        front_left_updated = 1;
-                        front_left_pressure_psi_x10 = sensor_data.pressure;
-                    } else if (strcmp(sensor_data.device_name, "TP") == 0) {  // Front Right
-                        front_right_temperature = sensor_data.temperature;
-                        front_right_pressure_psi = psi;
-                        front_right_voltage = sensor_data.battery_level;
-                        front_right_updated = 1;
-                        front_right_pressure_psi_x10 = sensor_data.pressure;
-                    } else if (strcmp(sensor_data.device_name, "ST") == 0) {  // Rear Left
-                        rear_left_temperature = sensor_data.temperature;
-                        rear_left_pressure_psi = psi;
-                        rear_left_voltage = sensor_data.battery_level;
-                        rear_left_updated = 1;
-                        rear_left_pressure_psi_x10 = sensor_data.pressure;
-                    } else if (strcmp(sensor_data.device_name, "SP") == 0) {  // Rear Right
-                        rear_right_temperature = sensor_data.temperature;
-                        rear_right_pressure_psi = psi;
-                        rear_right_voltage = sensor_data.battery_level;
-                        rear_right_updated = 1;
-                        rear_right_pressure_psi_x10 = sensor_data.pressure;
+                    // Lock mutex to protect sensor data variables
+                    if (xSemaphoreTake(sensor_data_mutex, portMAX_DELAY) == pdTRUE) {
+                        float psi = sensor_data.pressure / 10.0f;
+                        if (strcmp(sensor_data.device_name, "TT") == 0) {  // Front Left
+                            front_left_temperature = sensor_data.temperature;
+                            front_left_pressure_psi = psi;
+                            front_left_voltage = sensor_data.battery_level;
+                            front_left_updated = 1;
+                            front_left_pressure_psi_x10 = sensor_data.pressure;
+                        } else if (strcmp(sensor_data.device_name, "TP") == 0) {  // Front Right
+                            front_right_temperature = sensor_data.temperature;
+                            front_right_pressure_psi = psi;
+                            front_right_voltage = sensor_data.battery_level;
+                            front_right_updated = 1;
+                            front_right_pressure_psi_x10 = sensor_data.pressure;
+                        } else if (strcmp(sensor_data.device_name, "ST") == 0) {  // Rear Left
+                            rear_left_temperature = sensor_data.temperature;
+                            rear_left_pressure_psi = psi;
+                            rear_left_voltage = sensor_data.battery_level;
+                            rear_left_updated = 1;
+                            rear_left_pressure_psi_x10 = sensor_data.pressure;
+                        } else if (strcmp(sensor_data.device_name, "SP") == 0) {  // Rear Right
+                            rear_right_temperature = sensor_data.temperature;
+                            rear_right_pressure_psi = psi;
+                            rear_right_voltage = sensor_data.battery_level;
+                            rear_right_updated = 1;
+                            rear_right_pressure_psi_x10 = sensor_data.pressure;
+                        }
+                        xSemaphoreGive(sensor_data_mutex);
                     }
 
                     // Compact printf output
@@ -293,15 +394,81 @@ static void hci_evt_process(void *pvParameters) {
     }
 }
 
+// Timer callback for BLE scan status check (runs in timer task context)
+static void ble_scan_timer_callback(TimerHandle_t xTimer) {
+    // This timer can be used to:
+    // 1. Check scan status periodically
+    // 2. Restart scan if needed
+    // 3. Log scan statistics
+    
+    // Example: Log that scan is still active
+    ESP_LOGD(TAG, "BLE scan status check - scan is active");
+    
+    // Optional: Check if we need to restart scan
+    // (In a real scenario, you might want to restart if no devices found for a long time)
+}
+
 void ble_scanner_init(void) {
+    // Create mutex for sensor data
+    sensor_data_mutex = xSemaphoreCreateMutex();
+    if (sensor_data_mutex == NULL) {
+        ESP_LOGE(TAG, "Failed to create sensor data mutex");
+        return;
+    }
+    
+    // Create binary semaphore for device detection signaling
+    device_detected_sem = xSemaphoreCreateBinary();
+    if (device_detected_sem == NULL) {
+        ESP_LOGE(TAG, "Failed to create device detected semaphore");
+        return;
+    }
+
+    // Create mutex for alert throttling
+    s_alert_mutex = xSemaphoreCreateMutex();
+    if (s_alert_mutex == NULL) {
+        ESP_LOGE(TAG, "Failed to create alert mutex");
+        return;
+    }
+
+    // Create timer for throttling speaker queue submissions
+    s_speaker_alert_timer = xTimerCreate(
+        "speaker_alert_gate",
+        pdMS_TO_TICKS(SPEAKER_ALERT_INTERVAL_MS),
+        pdFALSE,
+        NULL,
+        speaker_alert_timer_callback
+    );
+    if (s_speaker_alert_timer == NULL) {
+        ESP_LOGE(TAG, "Failed to create speaker alert timer");
+        return;
+    } else {
+        ESP_LOGI(TAG, "Speaker alert timer created (%d ms window)", SPEAKER_ALERT_INTERVAL_MS);
+    }
+    
+    // Create FreeRTOS software timer for BLE scan status check
+    s_ble_scan_timer = xTimerCreate(
+        "ble_scan_check",                      // Timer name
+        pdMS_TO_TICKS(BLE_SCAN_CHECK_INTERVAL_MS), // Period: 30 seconds
+        pdTRUE,                                // Auto-reload (periodic)
+        (void*)0,                              // Timer ID
+        ble_scan_timer_callback                // Callback function
+    );
+    
+    if (s_ble_scan_timer == NULL) {
+        ESP_LOGE(TAG, "Failed to create BLE scan timer");
+    } else {
+        ESP_LOGI(TAG, "BLE scan status check timer created (%d ms period)", BLE_SCAN_CHECK_INTERVAL_MS);
+    }
+    
     esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT));
     ESP_ERROR_CHECK(esp_bt_controller_init(&bt_cfg));
     ESP_ERROR_CHECK(esp_bt_controller_enable(ESP_BT_MODE_BLE));
     ESP_ERROR_CHECK(esp_vhci_host_register_callback(&vhci_host_cb));
+    ESP_LOGI(TAG, "BLE scanner initialized with mutex, binary semaphore, and timer");
 }
 
-void ble_scanner_start(QueueHandle_t speaker_queue) {
+void ble_scanner_start(QueueHandle_t speaker_queue, EventGroupHandle_t event_group) {
     s_speaker_queue = speaker_queue;
     
     // Simplified command sequence
@@ -321,5 +488,37 @@ void ble_scanner_start(QueueHandle_t speaker_queue) {
     }
 
     xTaskCreatePinnedToCore(hci_evt_process, "hci_evt_process", 2048, NULL, 6, NULL, 0);
+    
+    // Start BLE scan status check timer
+    if (s_ble_scan_timer != NULL) {
+        if (xTimerStart(s_ble_scan_timer, 0) != pdPASS) {
+            ESP_LOGE(TAG, "Failed to start BLE scan timer");
+        } else {
+            ESP_LOGI(TAG, "BLE scan status check timer started");
+        }
+    }
+    
+    // Signal that BLE scanner is ready (after scan start)
+    if (event_group != NULL) {
+        vTaskDelay(pdMS_TO_TICKS(200)); // Wait for scan to actually start
+        xEventGroupSetBits(event_group, (1 << 2)); // BIT_BLE_READY
+        ESP_LOGI(TAG, "BLE scanner ready signal sent");
+    }
+}
+
+void ble_scanner_lock_sensor_data(void) {
+    if (sensor_data_mutex) {
+        xSemaphoreTake(sensor_data_mutex, portMAX_DELAY);
+    }
+}
+
+void ble_scanner_unlock_sensor_data(void) {
+    if (sensor_data_mutex) {
+        xSemaphoreGive(sensor_data_mutex);
+    }
+}
+
+SemaphoreHandle_t ble_scanner_get_device_detected_sem(void) {
+    return device_detected_sem;
 }
 

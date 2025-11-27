@@ -1,15 +1,31 @@
 #include "button.h"
 #include "tpms_config.h"
 #include "screen.h"
+#include "speaker.h"  // For speaker_update_voice_setting()
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "driver/gpio.h"
 #include <math.h>
 #include <freertos/task.h>
+#include <freertos/event_groups.h>
+#include <freertos/timers.h>
 
 static const char *TAG = "BUTTON";
 
 static QueueHandle_t s_ui_queue = NULL;
+static EventGroupHandle_t s_event_group = NULL;
+static TimerHandle_t s_button_poll_timer = NULL;
+static SemaphoreHandle_t s_button_poll_sem = NULL;
+
+// Timer callback for button polling (runs in timer task context)
+static void button_poll_timer_callback(TimerHandle_t xTimer) {
+    // Give semaphore to wake up button task
+    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+    if (s_button_poll_sem != NULL) {
+        xSemaphoreGiveFromISR(s_button_poll_sem, &xHigherPriorityTaskWoken);
+        portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+    }
+}
 
 #define MENU_COUNT 9
 #define TIRE_SWAP_COUNT 4
@@ -118,12 +134,14 @@ static bool button_update(button_t* b, int64_t now_us, bool* out_rising, bool* o
 }
 
 static void handle_high_temp_adjust(bool inc) {
+    tpms_config_lock();
     TPMS_Config* cfg = tpms_config_get();
     if (inc) {
         if (cfg->high_temp_warning < 100) cfg->high_temp_warning += 1;
     } else {
         if (cfg->high_temp_warning > 0) cfg->high_temp_warning -= 1;
     }
+    tpms_config_unlock();
     tpms_config_save();
 }
 
@@ -136,11 +154,24 @@ static void input_task(void* pv)
 
     buttons_init_polling();
 
+    // Signal that button is ready
+    if (s_event_group != NULL) {
+        xEventGroupSetBits(s_event_group, (1 << 4)); // BIT_BUTTON_READY
+        ESP_LOGI(TAG, "Button ready signal sent");
+    }
+
     ui_update_t init = {.mode = mode, .sel = sel, .sub = sub, .adjust = current_adjust, .toggle_mirror = 0};
     xQueueSend(s_ui_queue, &init, 0);
 
     for (;;) {
-        vTaskDelay(1);
+        // Wait for timer semaphore (5ms period) instead of vTaskDelay
+        if (s_button_poll_sem != NULL) {
+            xSemaphoreTake(s_button_poll_sem, portMAX_DELAY);
+        } else {
+            // Fallback to delay if semaphore not available
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+        
         int64_t now = esp_timer_get_time();
 
         bool up_rise=false, up_fall=false;
@@ -204,7 +235,6 @@ static void input_task(void* pv)
             if (s_btns[BTN_ID_MODE].suppress_click) {
                 s_btns[BTN_ID_MODE].suppress_click = false;
             } else if (!s_btns[BTN_ID_MODE].long_fired) {
-                TPMS_Config* cfg = tpms_config_get();
                 if (mode == MODE_HELLO) {
                     mode = MODE_MENU;
                 } else if (mode == MODE_MENU) {
@@ -218,43 +248,53 @@ static void input_task(void* pv)
                     } else {
                         mode = MODE_ITEM;
                         sub = 0;
-                        if (idx == 5) sub = (int)cfg->tire_swap;
+                        // Lock config to read tire_swap
+                        tpms_config_lock();
+                        if (idx == 5) sub = (int)tpms_config_get()->tire_swap;
+                        tpms_config_unlock();
                     }
                 } else if (mode == MODE_ITEM) {
                     int idx = sel % MENU_COUNT;
+                    tpms_config_lock();
+                    TPMS_Config* cfg = tpms_config_get();
                     if (idx == 0) {
                         cfg->warm_up_greetings = (sub == 0);
+                        tpms_config_unlock();
                         tpms_config_save();
                         mode = MODE_MENU;
                     } else if (idx == 1) {
-                        cfg->warning_settings = (sub == 0) ? VOICE_MALE : VOICE_FEMALE;
+                        voice_gender_t new_voice = (sub == 0) ? VOICE_MALE : VOICE_FEMALE;
+                        cfg->warning_settings = new_voice;
+                        tpms_config_unlock();
                         tpms_config_save();
+                        // Update speaker component with new voice setting (avoid lock/unlock on every audio play)
+                        speaker_update_voice_setting((uint8_t)new_voice);
                         mode = MODE_MENU;
                     } else if (idx == 2) {
+                        tpms_config_unlock();
                         current_adjust = (sub == 0) ? 1 : 2; // ADJ_FRONT_UPPER : ADJ_FRONT_LOWER
                         mode = MODE_ADJUST;
                     } else if (idx == 3) {
+                        tpms_config_unlock();
                         current_adjust = (sub == 0) ? 3 : 4; // ADJ_REAR_UPPER : ADJ_REAR_LOWER
                         mode = MODE_ADJUST;
                     } else if (idx == 5) {
                         cfg->tire_swap = (TireSwapMode)(sub % TIRE_SWAP_COUNT);
+                        TireSwapMode swap = cfg->tire_swap;
+                        tpms_config_unlock();
                         tpms_config_save();
-                        tpms_config_update_devices_by_swap_mode(cfg->tire_swap);
+                        tpms_config_update_devices_by_swap_mode(swap);
                         mode = MODE_MENU;
                     } else if (idx == 6) {
+                        tpms_config_unlock();
                         mode = MODE_SENSOR;
                     } else if (idx == 7) {
                         cfg->tire_pressure_unit = (sub == 0) ? PSI_UNIT : BAR_UNIT;
+                        tpms_config_unlock();
                         tpms_config_save();
                         mode = MODE_MENU;
-                    } else if (idx == 8) {
-                        if (sub == 1) {
-                            tpms_config_restore_defaults();
-                            ui_update_t u = {.mode = MODE_HELLO, .sel = 0, .sub = 0, .adjust = 0, .toggle_mirror = 0};
-                            xQueueSend(s_ui_queue, &u, 0);
-                        }
-                        mode = MODE_MENU;
                     } else {
+                        tpms_config_unlock();
                         mode = MODE_MENU;
                     }
                 } else if (mode == MODE_ADJUST || mode == MODE_SENSOR) {
@@ -300,34 +340,44 @@ static void input_task(void* pv)
             } else if (dn_rise) {
                 inc = false;
             } else {
-                vTaskDelay(pdMS_TO_TICKS(BTN_POLL_INTERVAL_MS));
+                // No button press, continue to wait for next timer tick
                 continue;
             }
 
             float step = 0.1f;
+            bool need_save = false;
+            
+            // Lock config to safely modify values
+            tpms_config_lock();
             TPMS_Config* cfg = tpms_config_get();
             if (inc) {
                 switch (current_adjust) {
                     case 1: // ADJ_FRONT_UPPER
                         cfg->front_tire_press_Upper_limit += step;
                         cfg->front_tire_press_Upper_limit = roundf(cfg->front_tire_press_Upper_limit * 10.0f) / 10.0f;
+                        need_save = true;
                         break;
                     case 2: // ADJ_FRONT_LOWER
                         cfg->front_tire_press_Lower_limit += step;
                         cfg->front_tire_press_Lower_limit = roundf(cfg->front_tire_press_Lower_limit * 10.0f) / 10.0f;
+                        need_save = true;
                         break;
                     case 3: // ADJ_REAR_UPPER
                         cfg->rear_tire_press_Upper_limit += step;
                         cfg->rear_tire_press_Upper_limit = roundf(cfg->rear_tire_press_Upper_limit * 10.0f) / 10.0f;
+                        need_save = true;
                         break;
                     case 4: // ADJ_REAR_LOWER
                         cfg->rear_tire_press_Lower_limit += step;
                         cfg->rear_tire_press_Lower_limit = roundf(cfg->rear_tire_press_Lower_limit * 10.0f) / 10.0f;
+                        need_save = true;
                         break;
                     case 5: // ADJ_HIGH_TEMP
+                        tpms_config_unlock();
                         handle_high_temp_adjust(true);
                         break;
                     default:
+                        tpms_config_unlock();
                         break;
                 }
             } else {
@@ -335,43 +385,87 @@ static void input_task(void* pv)
                     case 1: // ADJ_FRONT_UPPER
                         cfg->front_tire_press_Upper_limit -= step;
                         cfg->front_tire_press_Upper_limit = roundf(cfg->front_tire_press_Upper_limit * 10.0f) / 10.0f;
+                        need_save = true;
                         break;
                     case 2: // ADJ_FRONT_LOWER
                         cfg->front_tire_press_Lower_limit -= step;
                         cfg->front_tire_press_Lower_limit = roundf(cfg->front_tire_press_Lower_limit * 10.0f) / 10.0f;
+                        need_save = true;
                         break;
                     case 3: // ADJ_REAR_UPPER
                         cfg->rear_tire_press_Upper_limit -= step;
                         cfg->rear_tire_press_Upper_limit = roundf(cfg->rear_tire_press_Upper_limit * 10.0f) / 10.0f;
+                        need_save = true;
                         break;
                     case 4: // ADJ_REAR_LOWER
                         cfg->rear_tire_press_Lower_limit -= step;
                         cfg->rear_tire_press_Lower_limit = roundf(cfg->rear_tire_press_Lower_limit * 10.0f) / 10.0f;
+                        need_save = true;
                         break;
                     case 5: // ADJ_HIGH_TEMP
+                        tpms_config_unlock();
                         handle_high_temp_adjust(false);
                         break;
                     default:
+                        tpms_config_unlock();
                         break;
                 }
             }
-            if (current_adjust >= 1 && current_adjust <= 4) {
+            
+            if (need_save) {
+                tpms_config_unlock();
                 tpms_config_save();
+            } else if (current_adjust != 5) {
+                tpms_config_unlock();
             }
+            
             ui_update_t u = {.mode = mode, .sel = sel, .sub = sub, .adjust = current_adjust, .toggle_mirror = 0};
             xQueueSend(s_ui_queue, &u, 0);
         }
-
-        vTaskDelay(pdMS_TO_TICKS(BTN_POLL_INTERVAL_MS));
+        // No vTaskDelay here - timer will wake us up every 5ms
     }
 }
 
 void button_init(void) {
-    // Nothing to initialize here
+    // Create binary semaphore for timer signaling
+    s_button_poll_sem = xSemaphoreCreateBinary();
+    if (s_button_poll_sem == NULL) {
+        ESP_LOGE(TAG, "Failed to create button poll semaphore");
+        return;
+    }
+    
+    // Create FreeRTOS software timer for button polling (5ms period)
+    s_button_poll_timer = xTimerCreate(
+        "btn_poll",                           // Timer name
+        pdMS_TO_TICKS(10),  // Period: 5ms
+        pdTRUE,                               // Auto-reload (periodic)
+        (void*)0,                             // Timer ID
+        button_poll_timer_callback            // Callback function
+    );
+    
+    if (s_button_poll_timer == NULL) {
+        ESP_LOGE(TAG, "Failed to create button poll timer");
+        vSemaphoreDelete(s_button_poll_sem);
+        s_button_poll_sem = NULL;
+        return;
+    }
+    
+    ESP_LOGI(TAG, "Button polling timer created (5ms period)");
 }
 
-void button_task_start(QueueHandle_t ui_queue) {
+void button_task_start(QueueHandle_t ui_queue, EventGroupHandle_t event_group) {
     s_ui_queue = ui_queue;
+    s_event_group = event_group;
+    
+    // Start the button polling timer
+    if (s_button_poll_timer != NULL) {
+        if (xTimerStart(s_button_poll_timer, 0) != pdPASS) {
+            ESP_LOGE(TAG, "Failed to start button poll timer");
+        } else {
+            ESP_LOGI(TAG, "Button polling timer started");
+        }
+    }
+    
     xTaskCreate(input_task, "input_task", 3072, NULL, 3, NULL);
 }
 

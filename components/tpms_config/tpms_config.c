@@ -3,6 +3,8 @@
 #include "nvs_flash.h"
 #include <string.h>
 #include <esp_timer.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 
 static const char *TAG = "TPMS_CONFIG";
 
@@ -35,32 +37,65 @@ static const char* const device_names[] = {"TT", "TP", "ST", "SP"};
 static volatile bool cfg_dirty = false;
 static esp_timer_handle_t s_save_timer = NULL;
 
+// Mutexes for thread safety
+static SemaphoreHandle_t config_mutex = NULL;
+static SemaphoreHandle_t nvs_mutex = NULL;
+
 static void save_timer_cb(void* arg) {
     if (cfg_dirty) {
-        nvs_handle_t nvh;
-        esp_err_t err = nvs_open("tpms_storage", NVS_READWRITE, &nvh);
-        if (err == ESP_OK) {
-            err = nvs_set_blob(nvh, "tpms_config", &g_tpms_config, sizeof(TPMS_Config));
+        // Take NVS mutex to serialize NVS operations
+        if (xSemaphoreTake(nvs_mutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
+            nvs_handle_t nvh;
+            esp_err_t err = nvs_open("tpms_storage", NVS_READWRITE, &nvh);
             if (err == ESP_OK) {
-                err = nvs_commit(nvh);
-                if (err == ESP_OK) {
-                    ESP_LOGI(TAG, "NVS committed.");
+                // Take config mutex to read config safely
+                if (xSemaphoreTake(config_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                    err = nvs_set_blob(nvh, "tpms_config", &g_tpms_config, sizeof(TPMS_Config));
+                    xSemaphoreGive(config_mutex);
                 } else {
-                    ESP_LOGE(TAG, "NVS commit error: %s", esp_err_to_name(err));
+                    ESP_LOGE(TAG, "Failed to take config mutex in timer callback");
+                    err = ESP_ERR_TIMEOUT;
                 }
+                
+                if (err == ESP_OK) {
+                    err = nvs_commit(nvh);
+                    if (err == ESP_OK) {
+                        ESP_LOGI(TAG, "NVS committed.");
+                    } else {
+                        ESP_LOGE(TAG, "NVS commit error: %s", esp_err_to_name(err));
+                    }
+                } else {
+                    ESP_LOGE(TAG, "NVS set_blob error: %s", esp_err_to_name(err));
+                }
+                nvs_close(nvh);
             } else {
-                ESP_LOGE(TAG, "NVS set_blob error: %s", esp_err_to_name(err));
+                ESP_LOGE(TAG, "NVS open error: %s", esp_err_to_name(err));
             }
-            nvs_close(nvh);
+            xSemaphoreGive(nvs_mutex);
         } else {
-            ESP_LOGE(TAG, "NVS open error: %s", esp_err_to_name(err));
+            ESP_LOGW(TAG, "Failed to take NVS mutex in timer callback");
         }
         cfg_dirty = false;
     }
 }
 
 TPMS_Config* tpms_config_get(void) {
+    // Note: Caller should use tpms_config_lock/unlock for thread-safe access
+    // This function returns pointer directly for backward compatibility
+    // but it's not thread-safe. Use lock/unlock functions for safety.
     return &g_tpms_config;
+}
+
+void tpms_config_lock(void) {
+    if (config_mutex) {
+        xSemaphoreTake(config_mutex, portMAX_DELAY);
+    }
+}
+
+void tpms_config_unlock(void) {
+    if (config_mutex) {
+        xSemaphoreGive(config_mutex);
+    }
 }
 
 ai_device_t* tpms_config_get_devices(void) {
@@ -68,6 +103,21 @@ ai_device_t* tpms_config_get_devices(void) {
 }
 
 void tpms_config_init(void) {
+    // Create mutexes
+    config_mutex = xSemaphoreCreateMutex();
+    if (config_mutex == NULL) {
+        ESP_LOGE(TAG, "Failed to create config mutex");
+        return;
+    }
+    
+    nvs_mutex = xSemaphoreCreateMutex();
+    if (nvs_mutex == NULL) {
+        ESP_LOGE(TAG, "Failed to create NVS mutex");
+        vSemaphoreDelete(config_mutex);
+        config_mutex = NULL;
+        return;
+    }
+    
     const esp_timer_create_args_t save_tmr_args = {
         .callback = &save_timer_cb,
         .arg = NULL,
@@ -75,6 +125,7 @@ void tpms_config_init(void) {
         .name = "cfg_save"
     };
     ESP_ERROR_CHECK(esp_timer_create(&save_tmr_args, &s_save_timer));
+    ESP_LOGI(TAG, "TPMS config initialized with mutexes");
 }
 
 void tpms_config_load(void) {
@@ -106,12 +157,26 @@ void tpms_config_load(void) {
 }
 
 void tpms_config_save(void) {
+    // Take both mutexes to ensure thread-safe save
+    if (xSemaphoreTake(nvs_mutex, portMAX_DELAY) != pdTRUE) {
+        ESP_LOGE(TAG, "Failed to take NVS mutex");
+        return;
+    }
+    
+    if (xSemaphoreTake(config_mutex, portMAX_DELAY) != pdTRUE) {
+        ESP_LOGE(TAG, "Failed to take config mutex");
+        xSemaphoreGive(nvs_mutex);
+        return;
+    }
+    
     nvs_handle_t handle;
     esp_err_t err;
 
     err = nvs_open("tpms_storage", NVS_READWRITE, &handle);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Failed to open NVS: %s", esp_err_to_name(err));
+        xSemaphoreGive(config_mutex);
+        xSemaphoreGive(nvs_mutex);
         return;
     }
 
@@ -128,6 +193,8 @@ void tpms_config_save(void) {
     }
 
     nvs_close(handle);
+    xSemaphoreGive(config_mutex);
+    xSemaphoreGive(nvs_mutex);
 }
 
 void tpms_config_schedule_save(uint64_t delay_ms) {
@@ -140,6 +207,12 @@ void tpms_config_schedule_save(uint64_t delay_ms) {
 
 void tpms_config_update_devices_by_swap_mode(TireSwapMode mode) {
     const char* addresses[4];
+    
+    // Lock config to safely read addresses
+    if (xSemaphoreTake(config_mutex, portMAX_DELAY) != pdTRUE) {
+        ESP_LOGE(TAG, "Failed to take config mutex in update_devices");
+        return;
+    }
 
     switch(mode) {
         case TIRE_SWAP_INITIAL:
@@ -168,15 +241,24 @@ void tpms_config_update_devices_by_swap_mode(TireSwapMode mode) {
             break;
     }
 
+    // Update devices (g_ai_devices is only written here, no need to lock)
     for(int i = 0; i < 4; i++) {
         strncpy(g_ai_devices[i].address, addresses[i], sizeof(g_ai_devices[i].address));
         strncpy(g_ai_devices[i].name, device_names[i], sizeof(g_ai_devices[i].name));
         g_ai_devices[i].address[sizeof(g_ai_devices[i].address)-1] = '\0';
         g_ai_devices[i].name[sizeof(g_ai_devices[i].name)-1] = '\0';
     }
+    
+    xSemaphoreGive(config_mutex);
 }
 
 void tpms_config_restore_defaults(void) {
+    // Lock config to safely write defaults
+    if (xSemaphoreTake(config_mutex, portMAX_DELAY) != pdTRUE) {
+        ESP_LOGE(TAG, "Failed to take config mutex in restore_defaults");
+        return;
+    }
+    
     g_tpms_config.warm_up_greetings = 1;
     g_tpms_config.warning_settings = VOICE_FEMALE;
     g_tpms_config.front_tire_press_Upper_limit = 19.0;
@@ -193,6 +275,8 @@ void tpms_config_restore_defaults(void) {
     g_tpms_config.tire_pressure_unit = PSI_UNIT;
     g_tpms_config.display_mirrored = 0;
     g_tpms_config.version = 1;
+    
+    xSemaphoreGive(config_mutex);
 
     tpms_config_save();
     tpms_config_update_devices_by_swap_mode(g_tpms_config.tire_swap);

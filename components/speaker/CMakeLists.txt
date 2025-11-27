@@ -1,4 +1,4 @@
 idf_component_register(SRCS "speaker.c"
                     INCLUDE_DIRS "."
-                    REQUIRES driver)
+                    REQUIRES driver tpms_config)
 

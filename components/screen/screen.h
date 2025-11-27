@@ -32,10 +32,14 @@ typedef struct {
 void screen_init(void);
 
 // Start screen task
-void screen_task_start(QueueHandle_t ui_queue);
+// event_group: Event group to signal when screen is ready (optional, can be NULL)
+void screen_task_start(QueueHandle_t ui_queue, EventGroupHandle_t event_group);
 
 // Get UI queue (for other components to send updates)
 QueueHandle_t screen_get_ui_queue(void);
+
+// Get UI task handle (for task notifications)
+TaskHandle_t screen_get_task_handle(void);
 
 #ifdef __cplusplus
 }

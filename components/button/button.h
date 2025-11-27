@@ -30,7 +30,8 @@ extern "C" {
 void button_init(void);
 
 // Start button input task
-void button_task_start(QueueHandle_t ui_queue);
+// event_group: Event group to signal when button is ready (optional, can be NULL)
+void button_task_start(QueueHandle_t ui_queue, EventGroupHandle_t event_group);
 
 #ifdef __cplusplus
 }

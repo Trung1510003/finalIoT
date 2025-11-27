@@ -74,6 +74,11 @@ void tpms_config_update_devices_by_swap_mode(TireSwapMode mode);
 // Restore default settings
 void tpms_config_restore_defaults(void);
 
+// Lock/unlock config for thread-safe access
+// Use these when reading/writing config from multiple tasks
+void tpms_config_lock(void);
+void tpms_config_unlock(void);
+
 #ifdef __cplusplus
 }
 #endif

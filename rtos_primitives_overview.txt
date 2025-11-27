@@ -1,0 +1,61 @@
+RTOS primitives in SensorBLE_OLED
+=================================
+
+Mục tiêu: giải thích ngắn gọn cho người mới (thằng em bạn) hiểu vì sao mỗi primitive của FreeRTOS lại xuất hiện ở đúng vị trí đó và nguyên lý hoạt động tổng quan.
+
+1. Tasks (nhiệm vụ)
+-------------------
+- button/input_task (`components/button/button.c`): chạy vòng lặp đọc nút. Nó cần riêng một task vì phải phản hồi nhanh (mỗi 10 ms) và không nên block những phần khác của hệ thống.
+- screen/ui_task (`components/screen/screen.c`): quản lý OLED, đợi dữ liệu từ queue rồi vẽ. Giữ nó tách biệt giúp UI không bị lag bởi các công việc BLE hay âm thanh.
+- speaker_task + speaker_greeting_task + speaker_alert_task (`components/speaker/speaker.c`): chia làm task “quản lý”, task “chào mừng” (chạy một lần khi thấy đủ cảm biến) và task “cảnh báo” (chạy vô hạn để phát âm thanh). Việc tách nhỏ giúp tránh audio bị chặn khi còn phải đợi sự kiện khác.
+- hci_evt_process (`components/ble_scanner/ble_scanner.c`): tác vụ riêng cho BLE controller vì API yêu cầu một task luôn trực để nhận sự kiện từ VHCI.
+
+Nguyên lý: mỗi task là một luồng logic độc lập. Khi một chức năng cần chạy liên tục hoặc có thời điểm riêng (UI, audio, BLE), tạo task giúp hệ thống multitask thực sự.
+
+2. Queues (hàng đợi)
+--------------------
+- `s_ui_queue`: button task đẩy sự kiện điều khiển, screen task đọc. Đây là pattern producer/consumer: task A không cần biết trạng thái task B, chỉ cần gửi struct vào queue.
+- `s_speaker_queue`: ble_scanner gửi `sensor_data_t` khi có gói BLE, speaker_alert_task đọc và phát âm thanh. Điều này tách biệt tốc độ BLE (có thể burst) khỏi tốc độ phát audio (cần thời gian chờ file MP3).
+
+Nguyên lý: queue truyền dữ liệu an toàn giữa các task vì mỗi lần đọc/ghi đều thread-safe và có thể block chờ dữ liệu.
+
+3. Software timers
+------------------
+- `s_button_poll_timer`: cứ 10 ms gọi callback để “đánh thức” task đọc phím. Dùng timer vì FreeRTOS có sẵn cơ chế gọi định kỳ không cần tạo task phụ với `vTaskDelay`.
+- `s_ble_scan_timer`: mỗi 30 s kiểm tra tình trạng scan để đảm bảo BLE luôn chạy; đặt ở timer giúp logic này không block task khác.
+- `s_save_timer` (ESP timer trong `tpms_config.c`): trì hoãn việc ghi NVS đến khi người dùng dừng chỉnh, tránh ghi flash liên tục.
+
+Nguyên lý: timer phù hợp cho công việc định kỳ nhẹ, tránh spin-wait và tiết kiệm stack/task.
+
+4. Semaphores & Mutexes
+-----------------------
+- `s_button_poll_sem`: binary semaphore dùng như “chuông” từ timer callback đến input_task. Vì callback chạy trong context timer/ISR nên phải dùng semaphore để đánh thức task ở ngữ cảnh an toàn.
+- `device_detected_sem`: báo cho tác vụ khác rằng BLE vừa thấy cảm biến (kết nối với phần UI/speaker).
+- `sensor_data_mutex`, `s_playback_mutex`, `config_mutex`, `nvs_mutex`: tất cả là mutex để bảo vệ tài nguyên dùng chung (buffer sensor, phần cứng DFPlayer, cấu hình TPMS, NVS). Mutex bảo đảm chỉ một task truy cập tại một thời điểm và hỗ trợ priority inheritance – quan trọng khi nhiều task có mức ưu tiên khác nhau.
+
+Nguyên lý: semaphore binary dùng để báo sự kiện (give/take), mutex dùng để khóa tài nguyên dài hơi, giúp tránh race condition.
+
+5. Event groups
+---------------
+- `s_sensor_detection_events`: bốn bit tương ứng TT/TP/ST/SP. Khi BLE phát hiện cảm biến, speaker set bit tương ứng; speaker_task chờ đủ 4 bit thì phát file chào mừng. Event group cho phép “đợi đồng thời” nhiều sự kiện.
+- `event_group` truyền vào button/screen/speaker/BLE: mỗi module set bit sẵn sàng (`BIT_BUTTON_READY`, `BIT_SCREEN_READY`, `BIT_SPEAKER_READY`, `BIT_BLE_READY`). Phần main có thể chờ một event group duy nhất thay vì chen nhiều semaphore.
+
+Nguyên lý: event group như tập các flag 32-bit thread-safe. Bạn có thể chờ nhiều bit cùng lúc (AND/OR) để biết trạng thái hệ thống.
+
+6. Task notifications
+---------------------
+- Speaker manager chờ greeting task hoàn tất bằng `ulTaskNotifyTake`, greeting task báo xong bằng `xTaskNotifyGive`. Đây là cơ chế nhẹ hơn semaphore (không cần handle riêng) để đồng bộ hai task một-một.
+
+Nguyên lý: mỗi task có “mailbox” notification (tối đa 32-bit). Dùng tốt cho handshake nhanh giữa hai task liên quan chặt chẽ.
+
+Tổng kết
+--------
+- Task: chia công việc lớn thành luồng riêng.
+- Queue: truyền dữ liệu giữa nhiệm vụ mà không khóa chặt.
+- Timer: kích hoạt định kỳ mà không tạo thêm task.
+- Semaphore/Mutex: điều phối quyền truy cập tài nguyên và báo sự kiện.
+- Event group: quản lý trạng thái dạng bit và chờ nhiều điều kiện cùng lúc.
+- Task notification: signal nhẹ giữa hai task.
+
+Nhìn toàn cục, mỗi primitive được chọn vì nó phù hợp với yêu cầu thời gian thực cụ thể (đọc nút cần đều đặn, BLE cần mutex, audio phải khóa playback, v.v.). Đây là cách tổ chức điển hình của ứng dụng nhúng đa nhiệm: tách logic thành task chuyên dụng và dùng primitive phù hợp để giữ mọi phần đồng bộ nhưng không cản trở nhau.
+

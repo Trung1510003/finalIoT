@@ -6,6 +6,7 @@
 #include "u8g2_esp32_hal.h"
 #include <string.h>
 #include <math.h>
+#include <freertos/event_groups.h>
 
 static const char *TAG = "SCREEN";
 
@@ -16,6 +17,8 @@ static const char *TAG = "SCREEN";
 #define BLINK_INTERVAL_MS 500
 
 static QueueHandle_t s_ui_queue = NULL;
+static EventGroupHandle_t s_event_group = NULL;
+static TaskHandle_t s_ui_task_handle = NULL;
 
 // Menu constants
 #define MENU_COUNT 9
@@ -141,36 +144,55 @@ static void draw_hello_tpms(u8g2_t* u8g2) {
     u8g2_SetFontMode(u8g2, 1);
     u8g2_SetBitmapMode(u8g2, 1);
 
+    // Lock sensor data and config for thread-safe reading
+    ble_scanner_lock_sensor_data();
+    tpms_config_lock();
+    
+    // Read sensor data and config values atomically
+    float fl_pressure = front_left_pressure_psi;
+    float fr_pressure = front_right_pressure_psi;
+    float rl_pressure = rear_left_pressure_psi;
+    float rr_pressure = rear_right_pressure_psi;
+    int fl_temp = front_left_temperature;
+    int fr_temp = front_right_temperature;
+    int rl_temp = rear_left_temperature;
+    int rr_temp = rear_right_temperature;
+    float fl_voltage = front_left_voltage;
+    float fr_voltage = front_right_voltage;
+    float rl_voltage = rear_left_voltage;
+    float rr_voltage = rear_right_voltage;
+    
+    float front_lower = tpms_config_get()->front_tire_press_Lower_limit;
+    float front_upper = tpms_config_get()->front_tire_press_Upper_limit;
+    float rear_lower = tpms_config_get()->rear_tire_press_Lower_limit;
+    float rear_upper = tpms_config_get()->rear_tire_press_Upper_limit;
+    uint8_t high_temp = tpms_config_get()->high_temp_warning;
+    
+    tpms_config_unlock();
+    ble_scanner_unlock_sensor_data();
+
     // Check if pressures are within limits
-    bool fl_press_out_of_range = (front_left_pressure_psi < tpms_config_get()->front_tire_press_Lower_limit ||
-                                 front_left_pressure_psi > tpms_config_get()->front_tire_press_Upper_limit) &&
-                                     (front_left_pressure_psi > 0);
-    bool fr_press_out_of_range = (front_right_pressure_psi < tpms_config_get()->front_tire_press_Lower_limit ||
-                                 front_right_pressure_psi > tpms_config_get()->front_tire_press_Upper_limit) &&
-                                     (front_right_pressure_psi > 0);
-    bool rl_press_out_of_range = (rear_left_pressure_psi < tpms_config_get()->rear_tire_press_Lower_limit ||
-                                 rear_left_pressure_psi > tpms_config_get()->rear_tire_press_Upper_limit)&&
-                                     (rear_left_pressure_psi > 0);
-    bool rr_press_out_of_range = (rear_right_pressure_psi < tpms_config_get()->rear_tire_press_Lower_limit ||
-                                 rear_right_pressure_psi > tpms_config_get()->rear_tire_press_Upper_limit)&&
-                                     (rear_right_pressure_psi > 0);
+    bool fl_press_out_of_range = (fl_pressure < front_lower || fl_pressure > front_upper) && (fl_pressure > 0);
+    bool fr_press_out_of_range = (fr_pressure < front_lower || fr_pressure > front_upper) && (fr_pressure > 0);
+    bool rl_press_out_of_range = (rl_pressure < rear_lower || rl_pressure > rear_upper) && (rl_pressure > 0);
+    bool rr_press_out_of_range = (rr_pressure < rear_lower || rr_pressure > rear_upper) && (rr_pressure > 0);
 
     // Check if temperatures exceed high_temp_warning
-    bool fl_temp_out_of_range = (front_left_temperature > tpms_config_get()->high_temp_warning);
-    bool fr_temp_out_of_range = (front_right_temperature > tpms_config_get()->high_temp_warning);
-    bool rl_temp_out_of_range = (rear_left_temperature > tpms_config_get()->high_temp_warning);
-    bool rr_temp_out_of_range = (rear_right_temperature > tpms_config_get()->high_temp_warning);
+    bool fl_temp_out_of_range = (fl_temp > high_temp);
+    bool fr_temp_out_of_range = (fr_temp > high_temp);
+    bool rl_temp_out_of_range = (rl_temp > high_temp);
+    bool rr_temp_out_of_range = (rr_temp > high_temp);
 
-    bool fl_battery_out_of = (front_left_voltage < 2.8);
-    bool fr_battery_out_of = (front_right_voltage < 2.8);
-    bool rl_battery_out_of = (rear_left_voltage < 2.8);
-    bool rr_battery_out_of = (rear_right_voltage < 2.8);
+    bool fl_battery_out_of = (fl_voltage < 2.8);
+    bool fr_battery_out_of = (fr_voltage < 2.8);
+    bool rl_battery_out_of = (rl_voltage < 2.8);
+    bool rr_battery_out_of = (rr_voltage < 2.8);
 
 
     // Front Left
     u8g2_SetFont(u8g2, u8g2_font_helvB08_tf);
     if (!fl_temp_out_of_range || (fl_temp_out_of_range && blink_visible)) {
-        snprintf(helper_c_string, sizeof(helper_c_string), "%d%cC", front_left_temperature, 176);
+        snprintf(helper_c_string, sizeof(helper_c_string), "%d%cC", fl_temp, 176);
         u8g2_DrawStr(u8g2, 0, 24, helper_c_string);
     }
 
@@ -181,14 +203,14 @@ static void draw_hello_tpms(u8g2_t* u8g2) {
 
     u8g2_SetFont(u8g2, u8g2_font_profont17_tr);
     if (!fl_press_out_of_range || (fl_press_out_of_range && blink_visible)) {
-        snprintf(helper_c_string, sizeof(helper_c_string), "%.1f", front_left_pressure_psi);
+        snprintf(helper_c_string, sizeof(helper_c_string), "%.1f", fl_pressure);
         u8g2_DrawStr(u8g2, 0, 12, helper_c_string);
     }
 
     // Front Right
     u8g2_SetFont(u8g2, u8g2_font_helvB08_tf);
     if (!fr_temp_out_of_range || (fr_temp_out_of_range && blink_visible)) {
-        snprintf(helper_c_string, sizeof(helper_c_string), "%d%cC", front_right_temperature, 176);
+        snprintf(helper_c_string, sizeof(helper_c_string), "%d%cC", fr_temp, 176);
         helper_str_width = u8g2_GetStrWidth(u8g2, helper_c_string);
         u8g2_DrawStr(u8g2, 128 - helper_str_width, 24, helper_c_string);
     }
@@ -199,7 +221,7 @@ static void draw_hello_tpms(u8g2_t* u8g2) {
 
     u8g2_SetFont(u8g2, u8g2_font_profont17_tr);
     if (!fr_press_out_of_range || (fr_press_out_of_range && blink_visible)) {
-        snprintf(helper_c_string, sizeof(helper_c_string), "%.1f", front_right_pressure_psi);
+        snprintf(helper_c_string, sizeof(helper_c_string), "%.1f", fr_pressure);
         helper_str_width = u8g2_GetStrWidth(u8g2, helper_c_string);
         u8g2_DrawStr(u8g2, 128 - helper_str_width, 12, helper_c_string);
     }
@@ -207,7 +229,7 @@ static void draw_hello_tpms(u8g2_t* u8g2) {
     // Rear Left
     u8g2_SetFont(u8g2, u8g2_font_helvB08_tf);
     if (!rl_temp_out_of_range || (rl_temp_out_of_range && blink_visible)) {
-        snprintf(helper_c_string, sizeof(helper_c_string), "%d%cC", rear_left_temperature, 176);
+        snprintf(helper_c_string, sizeof(helper_c_string), "%d%cC", rl_temp, 176);
         u8g2_DrawStr(u8g2, 0, 62, helper_c_string);
     }
 
@@ -217,14 +239,14 @@ static void draw_hello_tpms(u8g2_t* u8g2) {
 
     u8g2_SetFont(u8g2, u8g2_font_profont17_tr);
     if (!rl_press_out_of_range || (rl_press_out_of_range && blink_visible)) {
-        snprintf(helper_c_string, sizeof(helper_c_string), "%.1f", rear_left_pressure_psi);
+        snprintf(helper_c_string, sizeof(helper_c_string), "%.1f", rl_pressure);
         u8g2_DrawStr(u8g2, 0, 50, helper_c_string);
     }
 
     // Rear Right
     u8g2_SetFont(u8g2, u8g2_font_helvB08_tf);
     if (!rr_temp_out_of_range || (rr_temp_out_of_range && blink_visible)) {
-        snprintf(helper_c_string, sizeof(helper_c_string), "%d%cC", rear_right_temperature, 176);
+        snprintf(helper_c_string, sizeof(helper_c_string), "%d%cC", rr_temp, 176);
         helper_str_width = u8g2_GetStrWidth(u8g2, helper_c_string);
         u8g2_DrawStr(u8g2, 128 - helper_str_width, 62, helper_c_string);
     }
@@ -235,7 +257,7 @@ static void draw_hello_tpms(u8g2_t* u8g2) {
 
     u8g2_SetFont(u8g2, u8g2_font_profont17_tr);
     if (!rr_press_out_of_range || (rr_press_out_of_range && blink_visible)) {
-        snprintf(helper_c_string, sizeof(helper_c_string), "%.1f", rear_right_pressure_psi);
+        snprintf(helper_c_string, sizeof(helper_c_string), "%.1f", rr_pressure);
         helper_str_width = u8g2_GetStrWidth(u8g2, helper_c_string);
         u8g2_DrawStr(u8g2, 128 - helper_str_width, 50, helper_c_string);
     }
@@ -247,12 +269,18 @@ static void draw_hello_tpms(u8g2_t* u8g2) {
     u8g2_DrawXBMP(u8g2, 78, 13, 50, 6,  image_arrow_FR_bits);
     u8g2_DrawXBMP(u8g2, 49,  9, 30, 49, image_car_bits);
 
+    // Lock config again to read unit and warm_up_greetings
+    tpms_config_lock();
+    unit_pressure_t unit = tpms_config_get()->tire_pressure_unit;
+    uint8_t warm_up = tpms_config_get()->warm_up_greetings;
+    tpms_config_unlock();
+
     u8g2_SetFont(u8g2, u8g2_font_helvB08_tf);
-    u8g2_DrawStr(u8g2, 44, 8, tpms_config_get()->tire_pressure_unit == PSI_UNIT ? "PSI" : "BAR");
+    u8g2_DrawStr(u8g2, 44, 8, unit == PSI_UNIT ? "PSI" : "BAR");
     u8g2_SetFont(u8g2, u8g2_font_open_iconic_embedded_1x_t);
     u8g2_DrawGlyph(u8g2, 68, 8, 0x0042);
     u8g2_SetFont(u8g2, u8g2_font_open_iconic_play_1x_t);
-    (tpms_config_get()->warm_up_greetings == 1)?
+    (warm_up == 1)?
     u8g2_DrawGlyph(u8g2, 80, 8, 0x0040): u8g2_DrawGlyph(u8g2, 80, 8, 0x0051);
 
 
@@ -414,11 +442,12 @@ static void draw_sensor_detail(u8g2_t* u8g2, int sensor_idx) {
     u8g2_DrawStr(u8g2, (128 - w)/2, 15, sensor_options[sensor_idx]);
     u8g2_DrawHLine(u8g2, 0, 19, 128);
 
-    u8g2_SetFont(u8g2, u8g2_font_helvB08_tf);
-    char buf[32];
-    snprintf(buf, sizeof(buf), "Name: %s", tpms_config_get()->short_name);
-    u8g2_DrawStr(u8g2, 10, 34, buf);
-
+    // Lock config to read safely
+    tpms_config_lock();
+    char short_name[16];
+    strncpy(short_name, tpms_config_get()->short_name, sizeof(short_name));
+    short_name[sizeof(short_name)-1] = '\0';
+    
     const char* address;
     switch (sensor_idx) {
         case 0: address = tpms_config_get()->addressB_FL; break;
@@ -427,7 +456,17 @@ static void draw_sensor_detail(u8g2_t* u8g2, int sensor_idx) {
         case 3: address = tpms_config_get()->addressB_RR; break;
         default: address = "Unknown"; break;
     }
-    snprintf(buf, sizeof(buf), "Addr: %s", address);
+    char addr_str[18];
+    strncpy(addr_str, address, sizeof(addr_str));
+    addr_str[sizeof(addr_str)-1] = '\0';
+    tpms_config_unlock();
+
+    u8g2_SetFont(u8g2, u8g2_font_helvB08_tf);
+    char buf[32];
+    snprintf(buf, sizeof(buf), "Name: %s", short_name);
+    u8g2_DrawStr(u8g2, 10, 34, buf);
+
+    snprintf(buf, sizeof(buf), "Addr: %s", addr_str);
     u8g2_DrawStr(u8g2, 10, 49, buf);
 
     u8g2_SetFont(u8g2, u8g2_font_6x12_t_symbols);
@@ -484,6 +523,8 @@ static void draw_adjust_screen(u8g2_t* u8g2, int adjust) {
     bool is_float = false;
     const char* unit = NULL;
 
+    // Lock config to read safely
+    tpms_config_lock();
     switch (adjust) {
         case 1: // ADJ_FRONT_UPPER
             title = "Front Upper Limit";
@@ -516,8 +557,10 @@ static void draw_adjust_screen(u8g2_t* u8g2, int adjust) {
             unit = "°C";
             break;
         default:
+            tpms_config_unlock();
             return;
     }
+    tpms_config_unlock();
 
     draw_adjust_number(u8g2, title, value, is_float, unit);
 }
@@ -525,66 +568,83 @@ static void draw_adjust_screen(u8g2_t* u8g2, int adjust) {
 static void draw_item_detail(u8g2_t* u8g2, int sel, int sub) {
     const int idx = (sel % MENU_COUNT + MENU_COUNT) % MENU_COUNT;
 
+    // Lock config to read safely
+    tpms_config_lock();
+    
     if (idx == 0) {
+        uint8_t warm_up = tpms_config_get()->warm_up_greetings;
+        tpms_config_unlock();
         draw_two_option_screen(u8g2,
                                "Warm-up greetings",
                                "Turn ON voice",
                                "Turn OFF voice",
                                (sub ? 1 : 0),
-                               (tpms_config_get()->warm_up_greetings ? 0 : 1));
+                               (warm_up ? 0 : 1));
         return;
     }
     if (idx == 1) {
+        voice_gender_t warning = tpms_config_get()->warning_settings;
+        tpms_config_unlock();
         draw_two_option_screen(u8g2,
                                "Warning settings",
                                "Voice: Male",
                                "Voice: Female",
                                (sub ? 1 : 0),
-                               (tpms_config_get()->warning_settings == VOICE_MALE ? 0 : 1));
+                               (warning == VOICE_MALE ? 0 : 1));
         return;
     }
     if (idx == 2) {
+        float front_upper = tpms_config_get()->front_tire_press_Upper_limit;
+        float front_lower = tpms_config_get()->front_tire_press_Lower_limit;
+        unit_pressure_t unit = tpms_config_get()->tire_pressure_unit;
+        tpms_config_unlock();
         char opt0[32];
         snprintf(opt0, sizeof(opt0), "Upper limit: %.1f %s",
-                 tpms_config_get()->front_tire_press_Upper_limit,
-                 tpms_config_get()->tire_pressure_unit == PSI_UNIT ? "PSI" : "BAR");
+                 front_upper, unit == PSI_UNIT ? "PSI" : "BAR");
         char opt1[32];
         snprintf(opt1, sizeof(opt1), "Lower limit: %.1f %s",
-                 tpms_config_get()->front_tire_press_Lower_limit,
-                 tpms_config_get()->tire_pressure_unit == PSI_UNIT ? "PSI" : "BAR");
+                 front_lower, unit == PSI_UNIT ? "PSI" : "BAR");
         draw_two_option_screen(u8g2, "Front tire pressure", opt0, opt1, sub, -1);
         return;
     }
     if (idx == 3) {
+        float rear_upper = tpms_config_get()->rear_tire_press_Upper_limit;
+        float rear_lower = tpms_config_get()->rear_tire_press_Lower_limit;
+        unit_pressure_t unit = tpms_config_get()->tire_pressure_unit;
+        tpms_config_unlock();
         char opt0[32];
         snprintf(opt0, sizeof(opt0), "Upper limit: %.1f %s",
-                 tpms_config_get()->rear_tire_press_Upper_limit,
-                 tpms_config_get()->tire_pressure_unit == PSI_UNIT ? "PSI" : "BAR");
+                 rear_upper, unit == PSI_UNIT ? "PSI" : "BAR");
         char opt1[32];
         snprintf(opt1, sizeof(opt1), "Lower limit: %.1f %s",
-                 tpms_config_get()->rear_tire_press_Lower_limit,
-                 tpms_config_get()->tire_pressure_unit == PSI_UNIT ? "PSI" : "BAR");
+                 rear_lower, unit == PSI_UNIT ? "PSI" : "BAR");
         draw_two_option_screen(u8g2, "Rear tire pressure", opt0, opt1, sub, -1);
         return;
     }
     if (idx == 5) {
-        draw_tire_swap_menu(u8g2, sub, (int)tpms_config_get()->tire_swap);
+        TireSwapMode swap = tpms_config_get()->tire_swap;
+        tpms_config_unlock();
+        draw_tire_swap_menu(u8g2, sub, (int)swap);
         return;
     }
     if (idx == 6) {
+        tpms_config_unlock();
         draw_sensor_menu(u8g2, sub);
         return;
     }
     if (idx == 7) {
+        unit_pressure_t unit = tpms_config_get()->tire_pressure_unit;
+        tpms_config_unlock();
         draw_two_option_screen(u8g2,
                                "Tire pressure unit",
                                "Unit: PSI",
                                "Unit: BAR",
                                (sub ? 1 : 0),
-                               (tpms_config_get()->tire_pressure_unit == PSI_UNIT ? 0 : 1));
+                               (unit == PSI_UNIT ? 0 : 1));
         return;
     }
     if (idx == 8) {
+        tpms_config_unlock();
         draw_two_option_screen(u8g2,
                                "Restore settings",
                                restore_options[0],
@@ -593,6 +653,8 @@ static void draw_item_detail(u8g2_t* u8g2, int sel, int sub) {
                                -1);
         return;
     }
+    
+    tpms_config_unlock();
 
     u8g2_ClearBuffer(u8g2);
     u8g2_SetFont(u8g2, u8g2_font_6x12_tf);
@@ -609,6 +671,9 @@ static void draw_item_detail(u8g2_t* u8g2, int sel, int sub) {
 }
 
 static void ui_task(void* pv) {
+    // Store task handle for task notifications
+    s_ui_task_handle = xTaskGetCurrentTaskHandle();
+    
     u8g2_esp32_hal_t hal = U8G2_ESP32_HAL_DEFAULT;
     hal.bus.i2c.sda = PIN_SDA;
     hal.bus.i2c.scl = PIN_SCL;
@@ -624,11 +689,21 @@ static void ui_task(void* pv) {
     u8g2_SetFontMode(&u8g2, 1);
     u8g2_SetBitmapMode(&u8g2, 1);
 
-    if (tpms_config_get()->display_mirrored) u8g2_SetDisplayRotation(&u8g2, U8G2_MIRROR);
-    else                        u8g2_SetDisplayRotation(&u8g2, U8G2_R0);
+    tpms_config_lock();
+    uint8_t mirrored = tpms_config_get()->display_mirrored;
+    tpms_config_unlock();
+    
+    if (mirrored) u8g2_SetDisplayRotation(&u8g2, U8G2_MIRROR);
+    else          u8g2_SetDisplayRotation(&u8g2, U8G2_R0);
 
 
     ESP_LOGI(TAG, "UI ready");
+    
+    // Signal that screen is ready
+    if (s_event_group != NULL) {
+        xEventGroupSetBits(s_event_group, (1 << 3)); // BIT_SCREEN_READY
+        ESP_LOGI(TAG, "Screen ready signal sent");
+    }
 
     ui_mode_t mode = MODE_HELLO;
     int sel = 0;
@@ -645,8 +720,12 @@ static void ui_task(void* pv) {
         // --- ƯU TIÊN: xử lý toggle mirror nếu có ---
         if (upd.toggle_mirror) {
             // Đổi trạng thái, áp dụng rotation cho U8G2
+            tpms_config_lock();
             tpms_config_get()->display_mirrored ^= 1;
-            if (tpms_config_get()->display_mirrored) {
+            uint8_t mirrored = tpms_config_get()->display_mirrored;
+            tpms_config_unlock();
+            
+            if (mirrored) {
                 u8g2_SetDisplayRotation(&u8g2, U8G2_MIRROR);
             } else {
                 u8g2_SetDisplayRotation(&u8g2, U8G2_R0);
@@ -716,11 +795,16 @@ void screen_init(void) {
     // Nothing to initialize here
 }
 
-void screen_task_start(QueueHandle_t ui_queue) {
+void screen_task_start(QueueHandle_t ui_queue, EventGroupHandle_t event_group) {
     s_ui_queue = ui_queue;
+    s_event_group = event_group;
     xTaskCreate(ui_task, "ui_task", 4096, NULL, 4, NULL);
 }
 
 QueueHandle_t screen_get_ui_queue(void) {
     return s_ui_queue;
+}
+
+TaskHandle_t screen_get_task_handle(void) {
+    return s_ui_task_handle;
 }

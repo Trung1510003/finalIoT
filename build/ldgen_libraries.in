@@ -153,8 +153,8 @@ $<TARGET_FILE:idf::wifi_provisioning>
 $<TARGET_FILE:__idf_json>
 $<TARGET_FILE:idf::tpms_config>
 $<TARGET_FILE:idf::speaker>
-$<TARGET_FILE:idf::ble_scanner>
 $<TARGET_FILE:__idf_tpms_config>
+$<TARGET_FILE:idf::ble_scanner>
 $<TARGET_FILE:__idf_speaker>
 $<TARGET_FILE:idf::u8g2>
 $<TARGET_FILE:idf::u8g2-hal-esp-idf>

@@ -40,7 +40,17 @@ extern float rear_right_pressure_psi;
 void ble_scanner_init(void);
 
 // Start BLE scanning
-void ble_scanner_start(QueueHandle_t speaker_queue);
+// event_group: Event group to signal when BLE is ready (optional, can be NULL)
+void ble_scanner_start(QueueHandle_t speaker_queue, EventGroupHandle_t event_group);
+
+// Lock/unlock sensor data for thread-safe access
+// Use these when reading sensor data from other tasks
+void ble_scanner_lock_sensor_data(void);
+void ble_scanner_unlock_sensor_data(void);
+
+// Get binary semaphore for new device detection notification
+// Returns NULL if not initialized
+SemaphoreHandle_t ble_scanner_get_device_detected_sem(void);
 
 #ifdef __cplusplus
 }
