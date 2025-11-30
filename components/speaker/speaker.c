@@ -1,5 +1,6 @@
 #include "speaker.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "driver/uart.h"
 #include <string.h>
 #include <stdbool.h>
@@ -38,20 +39,58 @@ typedef enum {
 // Guard time to ensure 14.mp3 finishes before the task self-deletes (ms)
 #define PLAYBACK_GUARD_TIME_MS 6000
 #define PRESSURE_ALERT_GUARD_MS 5000
+#define SENSOR_TIMEOUT_MS 20000  // 20 seconds timeout per sensor
+
+// Sensor priority order: TT (0) -> TP (1) -> ST (2) -> SP (3)
+// Lower priority number = higher priority (play first)
+static uint8_t speaker_get_sensor_priority(const char *device_name)
+{
+    if (device_name == NULL) {
+        return 99; // Unknown = lowest priority
+    }
+    if (strcmp(device_name, "TT") == 0) return 0; // Front Left - highest priority
+    if (strcmp(device_name, "TP") == 0) return 1; // Front Right
+    if (strcmp(device_name, "ST") == 0) return 2; // Rear Left
+    if (strcmp(device_name, "SP") == 0) return 3; // Rear Right - lowest priority
+    return 99; // Unknown
+}
 
 static EventGroupHandle_t s_sensor_event_group = NULL;
 static TaskHandle_t s_all_sensors_task_handle = NULL;
 static SemaphoreHandle_t s_audio_mutex = NULL;
 static bool s_alerts_enabled = false;
 static speaker_voice_t s_active_voice = SPEAKER_VOICE_FEMALE;
+static bool s_voice_enabled = true;
+
+// Priority queue for ordered alert playback
+#define PRIORITY_QUEUE_SIZE 4
+typedef struct {
+    sensor_data_t data;
+    bool valid;
+    uint8_t priority;
+    int64_t timestamp_us;  // Timestamp when alert was added
+} priority_alert_t;
+
+static priority_alert_t s_priority_queue[PRIORITY_QUEUE_SIZE] = {0};
+static SemaphoreHandle_t s_priority_queue_mutex = NULL;
+static uint8_t s_current_waiting_priority = 0;  // Current sensor priority being waited for (0=TT, 1=TP, 2=ST, 3=SP)
+static int64_t s_current_waiting_start_us = 0;  // Timestamp when started waiting for current sensor
 
 static EventBits_t speaker_get_sensor_bit(const char *device_name);
 static void speaker_all_sensors_task(void *pv);
 static void speaker_play_track_guarded(uint16_t track_id, uint32_t guard_time_ms);
 static uint16_t speaker_map_track_id(uint16_t female_track_id);
+static void speaker_priority_queue_add(const sensor_data_t *sensor_data);
+static bool speaker_priority_queue_get_next(sensor_data_t *out_data);
+static void speaker_priority_queue_remove(const char *device_name);
 
 static void send_command(uint8_t cmd, uint16_t param)
 {
+    if (!s_voice_enabled) {
+        ESP_LOGD(TAG, "Voice disabled - skipping command 0x%02x param 0x%04x", cmd, param);
+        return;
+    }
+
     uint8_t buf[10];
     uint16_t checksum = (uint16_t)(0xFFFF - (0xFF + 0x06 + cmd + (param >> 8) + (param & 0xFF)) + 1);
 
@@ -266,7 +305,173 @@ void speaker_update_voice_setting(uint8_t voice)
     }
 }
 
-// Task xử lý DFPlayer để phát âm thanh cảnh báo
+void speaker_set_voice_enabled(bool enabled)
+{
+    if (s_voice_enabled != enabled) {
+        s_voice_enabled = enabled;
+        ESP_LOGI(TAG, "Voice playback %s", enabled ? "enabled" : "disabled");
+    } else {
+        ESP_LOGD(TAG, "Voice playback already %s", enabled ? "enabled" : "disabled");
+    }
+}
+
+static void speaker_priority_queue_add(const sensor_data_t *sensor_data)
+{
+    if (sensor_data == NULL || s_priority_queue_mutex == NULL) {
+        return;
+    }
+
+    if (xSemaphoreTake(s_priority_queue_mutex, portMAX_DELAY) == pdTRUE) {
+        uint8_t priority = speaker_get_sensor_priority(sensor_data->device_name);
+        
+        // Tìm vị trí để chèn (thay thế nếu đã có cảnh báo cho cùng sensor)
+        int insert_idx = -1;
+        int replace_idx = -1;
+        
+        for (int i = 0; i < PRIORITY_QUEUE_SIZE; i++) {
+            if (!s_priority_queue[i].valid) {
+                if (insert_idx < 0) {
+                    insert_idx = i; // Vị trí trống đầu tiên
+                }
+            } else if (strcmp(s_priority_queue[i].data.device_name, sensor_data->device_name) == 0) {
+                replace_idx = i; // Đã có cảnh báo cho sensor này, thay thế
+                break;
+            }
+        }
+        
+        int target_idx = (replace_idx >= 0) ? replace_idx : insert_idx;
+        
+        if (target_idx >= 0) {
+            s_priority_queue[target_idx].data = *sensor_data;
+            s_priority_queue[target_idx].priority = priority;
+            s_priority_queue[target_idx].valid = true;
+            s_priority_queue[target_idx].timestamp_us = esp_timer_get_time();
+            ESP_LOGD(TAG, "Added alert to priority queue: %s (priority %d, idx %d)", 
+                     sensor_data->device_name, priority, target_idx);
+        } else {
+            ESP_LOGW(TAG, "Priority queue full, dropping alert for %s", sensor_data->device_name);
+        }
+        
+        xSemaphoreGive(s_priority_queue_mutex);
+    }
+}
+
+static bool speaker_priority_queue_get_next(sensor_data_t *out_data)
+{
+    if (out_data == NULL || s_priority_queue_mutex == NULL) {
+        return false;
+    }
+    
+    int64_t now_us = esp_timer_get_time();
+    bool found = false;
+    int target_idx = -1;
+    
+    if (xSemaphoreTake(s_priority_queue_mutex, portMAX_DELAY) == pdTRUE) {
+        // Kiểm tra có dữ liệu nào trong queue không
+        bool has_any_data = false;
+        for (int i = 0; i < PRIORITY_QUEUE_SIZE; i++) {
+            if (s_priority_queue[i].valid) {
+                has_any_data = true;
+                break;
+            }
+        }
+        
+        if (!has_any_data) {
+            // Không có dữ liệu nào, reset waiting state
+            s_current_waiting_priority = 0;
+            s_current_waiting_start_us = 0;
+            xSemaphoreGive(s_priority_queue_mutex);
+            return false;
+        }
+        
+        // Khởi tạo wait start time nếu chưa có
+        if (s_current_waiting_start_us == 0) {
+            s_current_waiting_start_us = now_us;
+        }
+        
+        // Kiểm tra sensor hiện tại đang chờ có dữ liệu không
+        for (int i = 0; i < PRIORITY_QUEUE_SIZE; i++) {
+            if (s_priority_queue[i].valid && s_priority_queue[i].priority == s_current_waiting_priority) {
+                target_idx = i;
+                found = true;
+                s_current_waiting_start_us = now_us;  // Reset timeout khi tìm thấy
+                break;
+            }
+        }
+        
+        // Nếu không tìm thấy sensor hiện tại, kiểm tra timeout
+        if (!found) {
+            int64_t wait_duration_ms = (now_us - s_current_waiting_start_us) / 1000;
+            if (wait_duration_ms >= SENSOR_TIMEOUT_MS) {
+                // Timeout: chuyển sang sensor tiếp theo (round-robin)
+                uint8_t old_priority = s_current_waiting_priority;
+                s_current_waiting_priority = (s_current_waiting_priority + 1) % 4;
+                s_current_waiting_start_us = now_us;
+                ESP_LOGI(TAG, "Timeout (%ld ms) for priority %d, moving to next priority %d", 
+                         wait_duration_ms, old_priority, s_current_waiting_priority);
+                
+                // Tìm sensor mới
+                for (int i = 0; i < PRIORITY_QUEUE_SIZE; i++) {
+                    if (s_priority_queue[i].valid && s_priority_queue[i].priority == s_current_waiting_priority) {
+                        target_idx = i;
+                        found = true;
+                        break;
+                    }
+                }
+                
+                // Nếu vẫn không tìm thấy, tiếp tục round-robin cho đến khi tìm thấy
+                int attempts = 0;
+                while (!found && attempts < 4) {
+                    s_current_waiting_priority = (s_current_waiting_priority + 1) % 4;
+                    s_current_waiting_start_us = now_us;
+                    for (int i = 0; i < PRIORITY_QUEUE_SIZE; i++) {
+                        if (s_priority_queue[i].valid && s_priority_queue[i].priority == s_current_waiting_priority) {
+                            target_idx = i;
+                            found = true;
+                            break;
+                        }
+                    }
+                    attempts++;
+                }
+            }
+        }
+        
+        if (found && target_idx >= 0) {
+            *out_data = s_priority_queue[target_idx].data;
+        }
+        
+        xSemaphoreGive(s_priority_queue_mutex);
+    }
+    
+    return found;
+}
+
+static void speaker_priority_queue_remove(const char *device_name)
+{
+    if (device_name == NULL || s_priority_queue_mutex == NULL) {
+        return;
+    }
+    
+    if (xSemaphoreTake(s_priority_queue_mutex, portMAX_DELAY) == pdTRUE) {
+        for (int i = 0; i < PRIORITY_QUEUE_SIZE; i++) {
+            if (s_priority_queue[i].valid && 
+                strcmp(s_priority_queue[i].data.device_name, device_name) == 0) {
+                uint8_t removed_priority = s_priority_queue[i].priority;
+                s_priority_queue[i].valid = false;
+                memset(&s_priority_queue[i].data, 0, sizeof(sensor_data_t));
+                ESP_LOGD(TAG, "Removed alert from priority queue: %s", device_name);
+                
+                // Sau khi phát xong, chuyển sang sensor tiếp theo trong vòng tròn
+                s_current_waiting_priority = (removed_priority + 1) % 4;
+                s_current_waiting_start_us = esp_timer_get_time();
+                break;
+            }
+        }
+        xSemaphoreGive(s_priority_queue_mutex);
+    }
+}
+
+// Task xử lý DFPlayer để phát âm thanh cảnh báo theo thứ tự ưu tiên
 static void speaker_task(void* pv)
 {
     QueueHandle_t queue = (QueueHandle_t)pv;
@@ -275,16 +480,43 @@ static void speaker_task(void* pv)
     ESP_LOGI(TAG, "Speaker task started");
     
     for (;;) {
-        // Chờ nhận dữ liệu từ speaker_queue
-        if (xQueueReceive(queue, &sensor_data, portMAX_DELAY) == pdTRUE) {
-            ESP_LOGI(TAG, "Playing audio alert for device: %s, Pressure: %u", 
+        // Bước 1: Nhận tất cả cảnh báo từ queue và thêm vào priority queue (timeout ngắn)
+        while (xQueueReceive(queue, &sensor_data, 0) == pdTRUE) {
+            ESP_LOGI(TAG, "Received alert for device: %s, Pressure: %u", 
                      sensor_data.device_name, sensor_data.pressure);
-
+            
             // Mark sensor as seen for the all-sensors event flow
             speaker_notify_sensor_detected(sensor_data.device_name);
             
+            // Thêm vào priority queue (thay thế nếu đã có cảnh báo cho cùng sensor)
+            speaker_priority_queue_add(&sensor_data);
+        }
+        
+        // Bước 2: Xử lý priority queue theo thứ tự ưu tiên (TT -> TP -> ST -> SP)
+        if (speaker_priority_queue_get_next(&sensor_data)) {
+            ESP_LOGI(TAG, "Playing audio alert for device: %s, Pressure: %u (priority order)", 
+                     sensor_data.device_name, sensor_data.pressure);
+            
             // Phát âm thanh dựa trên áp suất và vị trí lốp
             speaker_play_pressure_alert(&sensor_data);
+            
+            // Xóa khỏi priority queue sau khi phát xong
+            speaker_priority_queue_remove(sensor_data.device_name);
+            
+            // Tiếp tục xử lý priority queue (không nhận cảnh báo mới ngay)
+            continue;
+        }
+        
+        // Bước 3: Nếu priority queue rỗng, chờ cảnh báo mới với timeout
+        if (xQueueReceive(queue, &sensor_data, pdMS_TO_TICKS(100)) == pdTRUE) {
+            ESP_LOGI(TAG, "Received alert for device: %s, Pressure: %u", 
+                     sensor_data.device_name, sensor_data.pressure);
+            
+            // Mark sensor as seen for the all-sensors event flow
+            speaker_notify_sensor_detected(sensor_data.device_name);
+            
+            // Thêm vào priority queue
+            speaker_priority_queue_add(&sensor_data);
         }
     }
 }
@@ -294,6 +526,20 @@ void speaker_task_start(QueueHandle_t queue, EventGroupHandle_t event_group)
     if (queue == NULL) {
         ESP_LOGE(TAG, "Cannot start speaker task without queue");
         return;
+    }
+
+    // Initialize priority queue mutex
+    if (s_priority_queue_mutex == NULL) {
+        s_priority_queue_mutex = xSemaphoreCreateMutex();
+        if (s_priority_queue_mutex == NULL) {
+            ESP_LOGE(TAG, "Failed to create priority queue mutex");
+            return;
+        }
+        // Initialize queue
+        memset(s_priority_queue, 0, sizeof(s_priority_queue));
+        // Initialize waiting state - start with TT (priority 0)
+        s_current_waiting_priority = 0;
+        s_current_waiting_start_us = 0;
     }
 
     if (s_sensor_event_group == NULL) {

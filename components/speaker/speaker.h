@@ -2,6 +2,7 @@
 #define SPEAKER_H
 
 #include <stdint.h>
+#include <stdbool.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
 #include <freertos/event_groups.h>
@@ -39,6 +40,9 @@ void speaker_notify_sensor_detected(const char* device_name);
 // Call this from UI/button component when voice setting is changed
 // voice: VOICE_MALE (0) or VOICE_FEMALE (1)
 void speaker_update_voice_setting(uint8_t voice);
+
+// Enable/disable speaker playback (Warm-up greetings ON/OFF)
+void speaker_set_voice_enabled(bool enabled);
 
 #ifdef __cplusplus
 }

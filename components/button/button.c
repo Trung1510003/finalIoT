@@ -259,8 +259,10 @@ static void input_task(void* pv)
                     TPMS_Config* cfg = tpms_config_get();
                     if (idx == 0) {
                         cfg->warm_up_greetings = (sub == 0);
+                        bool voice_enabled = (cfg->warm_up_greetings != 0);
                         tpms_config_unlock();
                         tpms_config_save();
+                        speaker_set_voice_enabled(voice_enabled);
                         mode = MODE_MENU;
                     } else if (idx == 1) {
                         voice_gender_t new_voice = (sub == 0) ? VOICE_MALE : VOICE_FEMALE;

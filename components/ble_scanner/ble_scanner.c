@@ -301,9 +301,11 @@ static int host_rcv_pkt(uint8_t *data, uint16_t len) {
                         pressure_abnormal = true;
                     }
                     
-                    // Gửi dữ liệu vào speaker_queue nếu áp suất bất thường (throttled 15s)
-                    if (pressure_abnormal) {
-                        schedule_speaker_alert(&sensor_data);
+                    // Gửi dữ liệu vào speaker_queue nếu áp suất bất thường (gửi trực tiếp, không throttle)
+                    if (pressure_abnormal && s_speaker_queue != NULL) {
+                        if (xQueueSend(s_speaker_queue, &sensor_data, 0) != pdTRUE) {
+                            ESP_LOGW(TAG, "Speaker queue full, dropping alert for %s", sensor_data.device_name);
+                        }
                     }
 
                     // Update global variables based on device_name (assuming pressure in 0.1 PSI units)
