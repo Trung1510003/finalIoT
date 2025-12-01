@@ -25,6 +25,9 @@ typedef enum {
     TIRE_SWAP_HORIZONTAL 
 } TireSwapMode;
 
+#define TPMS_PSI_TO_BAR 0.0689476f
+#define TPMS_BAR_TO_PSI (1.0f / TPMS_PSI_TO_BAR)
+
 typedef struct {
     uint8_t  warm_up_greetings;
     voice_gender_t warning_settings;
@@ -78,6 +81,14 @@ void tpms_config_restore_defaults(void);
 // Use these when reading/writing config from multiple tasks
 void tpms_config_lock(void);
 void tpms_config_unlock(void);
+
+static inline float tpms_convert_psi_to_unit(float psi, unit_pressure_t unit) {
+    return (unit == PSI_UNIT) ? psi : (psi * TPMS_PSI_TO_BAR);
+}
+
+static inline float tpms_convert_unit_to_psi(float value, unit_pressure_t unit) {
+    return (unit == PSI_UNIT) ? value : (value * TPMS_BAR_TO_PSI);
+}
 
 #ifdef __cplusplus
 }

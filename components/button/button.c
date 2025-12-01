@@ -54,6 +54,17 @@ typedef struct {
 
 static button_t s_btns[BTN_ID_COUNT];
 
+static float adjust_pressure_value(float current_psi, unit_pressure_t unit, bool increase)
+{
+    float display = tpms_convert_psi_to_unit(current_psi, unit);
+    display += increase ? 0.1f : -0.1f;
+    display = roundf(display * 10.0f) / 10.0f;
+    if (display < 0.0f) {
+        display = 0.0f;
+    }
+    return tpms_convert_unit_to_psi(display, unit);
+}
+
 static void buttons_init_polling(void)
 {
     gpio_config_t io = {
@@ -346,32 +357,28 @@ static void input_task(void* pv)
                 continue;
             }
 
-            float step = 0.1f;
             bool need_save = false;
             
             // Lock config to safely modify values
             tpms_config_lock();
             TPMS_Config* cfg = tpms_config_get();
+            unit_pressure_t unit = cfg->tire_pressure_unit;
             if (inc) {
                 switch (current_adjust) {
                     case 1: // ADJ_FRONT_UPPER
-                        cfg->front_tire_press_Upper_limit += step;
-                        cfg->front_tire_press_Upper_limit = roundf(cfg->front_tire_press_Upper_limit * 10.0f) / 10.0f;
+                        cfg->front_tire_press_Upper_limit = adjust_pressure_value(cfg->front_tire_press_Upper_limit, unit, true);
                         need_save = true;
                         break;
                     case 2: // ADJ_FRONT_LOWER
-                        cfg->front_tire_press_Lower_limit += step;
-                        cfg->front_tire_press_Lower_limit = roundf(cfg->front_tire_press_Lower_limit * 10.0f) / 10.0f;
+                        cfg->front_tire_press_Lower_limit = adjust_pressure_value(cfg->front_tire_press_Lower_limit, unit, true);
                         need_save = true;
                         break;
                     case 3: // ADJ_REAR_UPPER
-                        cfg->rear_tire_press_Upper_limit += step;
-                        cfg->rear_tire_press_Upper_limit = roundf(cfg->rear_tire_press_Upper_limit * 10.0f) / 10.0f;
+                        cfg->rear_tire_press_Upper_limit = adjust_pressure_value(cfg->rear_tire_press_Upper_limit, unit, true);
                         need_save = true;
                         break;
                     case 4: // ADJ_REAR_LOWER
-                        cfg->rear_tire_press_Lower_limit += step;
-                        cfg->rear_tire_press_Lower_limit = roundf(cfg->rear_tire_press_Lower_limit * 10.0f) / 10.0f;
+                        cfg->rear_tire_press_Lower_limit = adjust_pressure_value(cfg->rear_tire_press_Lower_limit, unit, true);
                         need_save = true;
                         break;
                     case 5: // ADJ_HIGH_TEMP
@@ -385,23 +392,19 @@ static void input_task(void* pv)
             } else {
                 switch (current_adjust) {
                     case 1: // ADJ_FRONT_UPPER
-                        cfg->front_tire_press_Upper_limit -= step;
-                        cfg->front_tire_press_Upper_limit = roundf(cfg->front_tire_press_Upper_limit * 10.0f) / 10.0f;
+                        cfg->front_tire_press_Upper_limit = adjust_pressure_value(cfg->front_tire_press_Upper_limit, unit, false);
                         need_save = true;
                         break;
                     case 2: // ADJ_FRONT_LOWER
-                        cfg->front_tire_press_Lower_limit -= step;
-                        cfg->front_tire_press_Lower_limit = roundf(cfg->front_tire_press_Lower_limit * 10.0f) / 10.0f;
+                        cfg->front_tire_press_Lower_limit = adjust_pressure_value(cfg->front_tire_press_Lower_limit, unit, false);
                         need_save = true;
                         break;
                     case 3: // ADJ_REAR_UPPER
-                        cfg->rear_tire_press_Upper_limit -= step;
-                        cfg->rear_tire_press_Upper_limit = roundf(cfg->rear_tire_press_Upper_limit * 10.0f) / 10.0f;
+                        cfg->rear_tire_press_Upper_limit = adjust_pressure_value(cfg->rear_tire_press_Upper_limit, unit, false);
                         need_save = true;
                         break;
                     case 4: // ADJ_REAR_LOWER
-                        cfg->rear_tire_press_Lower_limit -= step;
-                        cfg->rear_tire_press_Lower_limit = roundf(cfg->rear_tire_press_Lower_limit * 10.0f) / 10.0f;
+                        cfg->rear_tire_press_Lower_limit = adjust_pressure_value(cfg->rear_tire_press_Lower_limit, unit, false);
                         need_save = true;
                         break;
                     case 5: // ADJ_HIGH_TEMP

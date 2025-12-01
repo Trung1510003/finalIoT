@@ -167,9 +167,16 @@ static void draw_hello_tpms(u8g2_t* u8g2) {
     float rear_lower = tpms_config_get()->rear_tire_press_Lower_limit;
     float rear_upper = tpms_config_get()->rear_tire_press_Upper_limit;
     uint8_t high_temp = tpms_config_get()->high_temp_warning;
+    unit_pressure_t unit = tpms_config_get()->tire_pressure_unit;
+    uint8_t warm_up = tpms_config_get()->warm_up_greetings;
     
     tpms_config_unlock();
     ble_scanner_unlock_sensor_data();
+
+    float fl_display_pressure = tpms_convert_psi_to_unit(fl_pressure, unit);
+    float fr_display_pressure = tpms_convert_psi_to_unit(fr_pressure, unit);
+    float rl_display_pressure = tpms_convert_psi_to_unit(rl_pressure, unit);
+    float rr_display_pressure = tpms_convert_psi_to_unit(rr_pressure, unit);
 
     // Check if pressures are within limits
     bool fl_press_out_of_range = (fl_pressure < front_lower || fl_pressure > front_upper) && (fl_pressure > 0);
@@ -203,7 +210,7 @@ static void draw_hello_tpms(u8g2_t* u8g2) {
 
     u8g2_SetFont(u8g2, u8g2_font_profont17_tr);
     if (!fl_press_out_of_range || (fl_press_out_of_range && blink_visible)) {
-        snprintf(helper_c_string, sizeof(helper_c_string), "%.1f", fl_pressure);
+        snprintf(helper_c_string, sizeof(helper_c_string), "%.1f", fl_display_pressure);
         u8g2_DrawStr(u8g2, 0, 12, helper_c_string);
     }
 
@@ -221,7 +228,7 @@ static void draw_hello_tpms(u8g2_t* u8g2) {
 
     u8g2_SetFont(u8g2, u8g2_font_profont17_tr);
     if (!fr_press_out_of_range || (fr_press_out_of_range && blink_visible)) {
-        snprintf(helper_c_string, sizeof(helper_c_string), "%.1f", fr_pressure);
+        snprintf(helper_c_string, sizeof(helper_c_string), "%.1f", fr_display_pressure);
         helper_str_width = u8g2_GetStrWidth(u8g2, helper_c_string);
         u8g2_DrawStr(u8g2, 128 - helper_str_width, 12, helper_c_string);
     }
@@ -239,7 +246,7 @@ static void draw_hello_tpms(u8g2_t* u8g2) {
 
     u8g2_SetFont(u8g2, u8g2_font_profont17_tr);
     if (!rl_press_out_of_range || (rl_press_out_of_range && blink_visible)) {
-        snprintf(helper_c_string, sizeof(helper_c_string), "%.1f", rl_pressure);
+        snprintf(helper_c_string, sizeof(helper_c_string), "%.1f", rl_display_pressure);
         u8g2_DrawStr(u8g2, 0, 50, helper_c_string);
     }
 
@@ -257,7 +264,7 @@ static void draw_hello_tpms(u8g2_t* u8g2) {
 
     u8g2_SetFont(u8g2, u8g2_font_profont17_tr);
     if (!rr_press_out_of_range || (rr_press_out_of_range && blink_visible)) {
-        snprintf(helper_c_string, sizeof(helper_c_string), "%.1f", rr_pressure);
+        snprintf(helper_c_string, sizeof(helper_c_string), "%.1f", rr_display_pressure);
         helper_str_width = u8g2_GetStrWidth(u8g2, helper_c_string);
         u8g2_DrawStr(u8g2, 128 - helper_str_width, 50, helper_c_string);
     }
@@ -270,11 +277,6 @@ static void draw_hello_tpms(u8g2_t* u8g2) {
     u8g2_DrawXBMP(u8g2, 49,  9, 30, 49, image_car_bits);
 
     // Lock config again to read unit and warm_up_greetings
-    tpms_config_lock();
-    unit_pressure_t unit = tpms_config_get()->tire_pressure_unit;
-    uint8_t warm_up = tpms_config_get()->warm_up_greetings;
-    tpms_config_unlock();
-
     u8g2_SetFont(u8g2, u8g2_font_helvB08_tf);
     u8g2_DrawStr(u8g2, 44, 8, unit == PSI_UNIT ? "PSI" : "BAR");
     u8g2_SetFont(u8g2, u8g2_font_open_iconic_embedded_1x_t);
@@ -525,34 +527,37 @@ static void draw_adjust_screen(u8g2_t* u8g2, int adjust) {
 
     // Lock config to read safely
     tpms_config_lock();
+    TPMS_Config* cfg = tpms_config_get();
+    unit_pressure_t current_unit = cfg->tire_pressure_unit;
+    const char* unit_label = (current_unit == PSI_UNIT) ? "PSI" : "BAR";
     switch (adjust) {
         case 1: // ADJ_FRONT_UPPER
             title = "Front Upper Limit";
-            value = tpms_config_get()->front_tire_press_Upper_limit;
+            value = tpms_convert_psi_to_unit(cfg->front_tire_press_Upper_limit, current_unit);
             is_float = true;
-            unit = tpms_config_get()->tire_pressure_unit == PSI_UNIT ? "PSI" : "BAR";
+            unit = unit_label;
             break;
         case 2: // ADJ_FRONT_LOWER
             title = "Front Lower Limit";
-            value = tpms_config_get()->front_tire_press_Lower_limit;
+            value = tpms_convert_psi_to_unit(cfg->front_tire_press_Lower_limit, current_unit);
             is_float = true;
-            unit = tpms_config_get()->tire_pressure_unit == PSI_UNIT ? "PSI" : "BAR";
+            unit = unit_label;
             break;
         case 3: // ADJ_REAR_UPPER
             title = "Rear Upper Limit";
-            value = tpms_config_get()->rear_tire_press_Upper_limit;
+            value = tpms_convert_psi_to_unit(cfg->rear_tire_press_Upper_limit, current_unit);
             is_float = true;
-            unit = tpms_config_get()->tire_pressure_unit == PSI_UNIT ? "PSI" : "BAR";
+            unit = unit_label;
             break;
         case 4: // ADJ_REAR_LOWER
             title = "Rear Lower Limit";
-            value = tpms_config_get()->rear_tire_press_Lower_limit;
+            value = tpms_convert_psi_to_unit(cfg->rear_tire_press_Lower_limit, current_unit);
             is_float = true;
-            unit = tpms_config_get()->tire_pressure_unit == PSI_UNIT ? "PSI" : "BAR";
+            unit = unit_label;
             break;
         case 5: // ADJ_HIGH_TEMP
             title = "High temp warning";
-            value = (float)tpms_config_get()->high_temp_warning;
+            value = (float)cfg->high_temp_warning;
             is_float = false;
             unit = "°C";
             break;
@@ -597,13 +602,15 @@ static void draw_item_detail(u8g2_t* u8g2, int sel, int sub) {
         float front_upper = tpms_config_get()->front_tire_press_Upper_limit;
         float front_lower = tpms_config_get()->front_tire_press_Lower_limit;
         unit_pressure_t unit = tpms_config_get()->tire_pressure_unit;
+        float front_upper_disp = tpms_convert_psi_to_unit(front_upper, unit);
+        float front_lower_disp = tpms_convert_psi_to_unit(front_lower, unit);
         tpms_config_unlock();
         char opt0[32];
         snprintf(opt0, sizeof(opt0), "Upper limit: %.1f %s",
-                 front_upper, unit == PSI_UNIT ? "PSI" : "BAR");
+                 front_upper_disp, unit == PSI_UNIT ? "PSI" : "BAR");
         char opt1[32];
         snprintf(opt1, sizeof(opt1), "Lower limit: %.1f %s",
-                 front_lower, unit == PSI_UNIT ? "PSI" : "BAR");
+                 front_lower_disp, unit == PSI_UNIT ? "PSI" : "BAR");
         draw_two_option_screen(u8g2, "Front tire pressure", opt0, opt1, sub, -1);
         return;
     }
@@ -611,13 +618,15 @@ static void draw_item_detail(u8g2_t* u8g2, int sel, int sub) {
         float rear_upper = tpms_config_get()->rear_tire_press_Upper_limit;
         float rear_lower = tpms_config_get()->rear_tire_press_Lower_limit;
         unit_pressure_t unit = tpms_config_get()->tire_pressure_unit;
+        float rear_upper_disp = tpms_convert_psi_to_unit(rear_upper, unit);
+        float rear_lower_disp = tpms_convert_psi_to_unit(rear_lower, unit);
         tpms_config_unlock();
         char opt0[32];
         snprintf(opt0, sizeof(opt0), "Upper limit: %.1f %s",
-                 rear_upper, unit == PSI_UNIT ? "PSI" : "BAR");
+                 rear_upper_disp, unit == PSI_UNIT ? "PSI" : "BAR");
         char opt1[32];
         snprintf(opt1, sizeof(opt1), "Lower limit: %.1f %s",
-                 rear_lower, unit == PSI_UNIT ? "PSI" : "BAR");
+                 rear_lower_disp, unit == PSI_UNIT ? "PSI" : "BAR");
         draw_two_option_screen(u8g2, "Rear tire pressure", opt0, opt1, sub, -1);
         return;
     }
