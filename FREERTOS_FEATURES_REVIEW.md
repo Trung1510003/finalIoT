@@ -49,7 +49,7 @@ void tpms_config_schedule_save(uint64_t delay_ms) {
 
 **Đánh giá**: ✅ Tốt - Sử dụng ESP-IDF timer cho deferred save, tránh ghi NVS quá thường xuyên.
 
-### FreeRTOS Software Timer - **ĐÃ SỬ DỤNG** (2 timers)
+### FreeRTOS Software Timer - **ĐÃ SỬ DỤNG** (3 timers)
 
 #### Timer 1: Button Polling Timer
 **Vị trí**: `components/button/button.c`
@@ -61,6 +61,7 @@ void tpms_config_schedule_save(uint64_t delay_ms) {
 // Timer callback (runs in timer task context)
 static void button_poll_timer_callback(TimerHandle_t xTimer) {
     // Give semaphore to wake up button task
+    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
     if (s_button_poll_sem != NULL) {
         xSemaphoreGiveFromISR(s_button_poll_sem, &xHigherPriorityTaskWoken);
         portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
@@ -107,11 +108,45 @@ s_ble_scan_timer = xTimerCreate(
 
 **Đánh giá**: ✅ Tốt - Periodic check cho BLE scan status, có thể mở rộng để restart scan nếu cần.
 
+#### Timer 3: Speaker Alert Throttling Timer
+**Vị trí**: `components/ble_scanner/ble_scanner.c`
+
+**Mục đích**: Throttle speaker alerts để tránh spam (8 giây window)
+
+**Code**:
+```c
+#define SPEAKER_ALERT_INTERVAL_MS 8000
+
+// Timer callback - gửi pending alert vào speaker queue
+static void speaker_alert_timer_callback(TimerHandle_t xTimer) {
+    // Lấy pending alert từ mutex-protected buffer
+    if (xSemaphoreTake(s_alert_mutex, portMAX_DELAY) == pdTRUE) {
+        if (s_pending_alert_valid) {
+            // Gửi vào speaker queue
+            xQueueSend(s_speaker_queue, &s_pending_alert, 0);
+            s_pending_alert_valid = false;
+        }
+        xSemaphoreGive(s_alert_mutex);
+    }
+}
+
+// Create timer in ble_scanner_init()
+s_speaker_alert_timer = xTimerCreate(
+    "speaker_alert_gate",
+    pdMS_TO_TICKS(SPEAKER_ALERT_INTERVAL_MS), // 8 seconds
+    pdFALSE,  // One-shot (not auto-reload)
+    NULL,
+    speaker_alert_timer_callback
+);
+```
+
+**Đánh giá**: ✅ Tốt - Throttling mechanism để tránh gửi quá nhiều alerts vào speaker queue, đảm bảo audio không bị gián đoạn.
+
 ---
 
 ## 2. ✅ SEMAPHORES
 
-### Mutex - **ĐÃ SỬ DỤNG** (3 mutexes)
+### Mutex - **ĐÃ SỬ DỤNG** (6 mutexes)
 
 #### 2.1. Config Mutex
 **Vị trí**: `components/tpms_config/tpms_config.c`
@@ -176,9 +211,56 @@ void ble_scanner_unlock_sensor_data(void) {
 
 **Bảo vệ**: Global sensor data variables (front_left_*, front_right_*, rear_left_*, rear_right_*)
 
-**Đánh giá**: ✅ Tốt - Đã bảo vệ tất cả shared data với mutex.
+#### 2.4. Alert Mutex
+**Vị trí**: `components/ble_scanner/ble_scanner.c`
+```c
+static SemaphoreHandle_t s_alert_mutex = NULL;
 
-### Binary Semaphore - **ĐÃ SỬ DỤNG**
+// Tạo trong ble_scanner_init()
+s_alert_mutex = xSemaphoreCreateMutex();
+
+// Sử dụng trong:
+// - schedule_speaker_alert() - bảo vệ s_pending_alert
+// - speaker_alert_timer_callback() - đọc pending alert
+```
+
+**Bảo vệ**: `s_pending_alert` và `s_pending_alert_valid` - buffer cho alert throttling.
+
+#### 2.5. Audio Mutex
+**Vị trí**: `components/speaker/speaker.c`
+```c
+static SemaphoreHandle_t s_audio_mutex = NULL;
+
+// Tạo trong speaker_init()
+s_audio_mutex = xSemaphoreCreateMutex();
+
+// Sử dụng trong:
+// - speaker_play_track_guarded() - bảo vệ UART operations
+```
+
+**Bảo vệ**: UART operations khi gửi commands đến DFPlayer, tránh conflict khi nhiều task gọi phát audio.
+
+#### 2.6. Priority Queue Mutex
+**Vị trí**: `components/speaker/speaker.c`
+```c
+static SemaphoreHandle_t s_priority_queue_mutex = NULL;
+
+// Tạo trong speaker_task_start()
+s_priority_queue_mutex = xSemaphoreCreateMutex();
+
+// Sử dụng trong:
+// - speaker_priority_queue_add()
+// - speaker_priority_queue_get_next()
+// - speaker_priority_queue_remove()
+```
+
+**Bảo vệ**: `s_priority_queue[]` - priority queue cho alerts theo thứ tự ưu tiên (TT → TP → ST → SP).
+
+**Đánh giá**: ✅ Tốt - Đã bảo vệ tất cả shared data với mutex, bao gồm cả alert throttling và priority queue.
+
+### Binary Semaphore - **ĐÃ SỬ DỤNG** (2 semaphores)
+
+#### Binary Semaphore 1: Device Detected Semaphore
 **Vị trí**: `components/ble_scanner/ble_scanner.c`
 
 **Mục đích**: Signal khi có BLE device mới được phát hiện
@@ -202,6 +284,33 @@ SemaphoreHandle_t ble_scanner_get_device_detected_sem(void);
 ```
 
 **Đánh giá**: ✅ Tốt - Lightweight signaling mechanism cho device detection events.
+
+#### Binary Semaphore 2: Button Poll Semaphore
+**Vị trí**: `components/button/button.c`
+
+**Mục đích**: Signal từ timer callback để wake up button task (thay vì dùng vTaskDelay)
+
+**Code**:
+```c
+static SemaphoreHandle_t s_button_poll_sem = NULL;
+
+// Create trong button_init()
+s_button_poll_sem = xSemaphoreCreateBinary();
+
+// Timer callback gives semaphore
+static void button_poll_timer_callback(TimerHandle_t xTimer) {
+    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+    if (s_button_poll_sem != NULL) {
+        xSemaphoreGiveFromISR(s_button_poll_sem, &xHigherPriorityTaskWoken);
+        portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+    }
+}
+
+// Button task waits on semaphore
+xSemaphoreTake(s_button_poll_sem, portMAX_DELAY);
+```
+
+**Đánh giá**: ✅ Tốt - Cho phép timer callback (ISR context) wake up button task một cách an toàn.
 
 ### Counting Semaphore - **CHƯA SỬ DỤNG**
 **Không tìm thấy**: `xSemaphoreCreateCounting`
@@ -325,45 +434,92 @@ ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 
 ---
 
-## 5. TỔNG KẾT
+## 5. ✅ QUEUE
+
+### **ĐÃ SỬ DỤNG** (2 queues)
+
+#### Queue 1: UI Queue
+**Vị trí**: `main/main.c`, `components/button/button.c`, `components/screen/screen.c`
+
+**Mục đích**: Giao tiếp giữa button task và screen task
+
+**Code**:
+```c
+// Create trong main.c
+QueueHandle_t ui_queue = xQueueCreate(8, sizeof(ui_update_t));
+
+// Button task gửi updates
+xQueueSend(s_ui_queue, &upd, 0);
+
+// Screen task nhận updates
+xQueueReceive(s_ui_queue, &upd, pdMS_TO_TICKS(BLINK_INTERVAL_MS));
+```
+
+**Kích thước**: 8 items, mỗi item là `ui_update_t` structure
+
+#### Queue 2: Speaker Queue
+**Vị trí**: `main/main.c`, `components/ble_scanner/ble_scanner.c`, `components/speaker/speaker.c`
+
+**Mục đích**: Giao tiếp giữa BLE scanner task và speaker task để gửi alerts
+
+**Code**:
+```c
+// Create trong main.c
+QueueHandle_t speaker_queue = xQueueCreate(1, sizeof(sensor_data_t));
+
+// BLE scanner gửi alerts (qua timer callback)
+xQueueSend(s_speaker_queue, &pending, 0);
+
+// Speaker task nhận alerts
+xQueueReceive(speaker_queue, &sensor_data, portMAX_DELAY);
+```
+
+**Kích thước**: 1 item, mỗi item là `sensor_data_t` structure
+
+**Đánh giá**: ✅ Tốt - Queue size nhỏ (1 item) cho speaker queue để tránh audio backlog, queue lớn hơn (8 items) cho UI để xử lý nhiều button events.
+
+---
+
+## 6. TỔNG KẾT
 
 | Tính năng | Trạng thái | Số lượng | Ghi chú |
 |-----------|------------|----------|---------|
-| **ESP-IDF Timer** | ✅ Đã dùng | 1 | Deferred NVS save |
-| **FreeRTOS Software Timer** | ✅ Đã dùng | 2 | Button polling (5ms), BLE scan check (30s) |
-| **Mutex** | ✅ Đã dùng | 3 | Config, NVS, Sensor Data |
-| **Binary Semaphore** | ❌ Chưa dùng | 0 | Có thể dùng cho ISR signaling |
+| **ESP-IDF Timer** | ✅ Đã dùng | 1 | Deferred NVS save (800ms) |
+| **FreeRTOS Software Timer** | ✅ Đã dùng | 3 | Button polling (5ms), BLE scan check (30s), Speaker alert throttle (8s) |
+| **Mutex** | ✅ Đã dùng | 6 | Config, NVS, Sensor Data, Alert, Audio, Priority Queue |
+| **Binary Semaphore** | ✅ Đã dùng | 2 | Device detected, Button poll signaling |
 | **Counting Semaphore** | ❌ Chưa dùng | 0 | Có thể dùng cho resource pool |
-| **Event Group** | ✅ Đã dùng | 1 | System initialization sync |
+| **Event Group** | ✅ Đã dùng | 1 | System initialization sync (5 bits) |
 | **Task Notification** | ✅ Đã dùng | 1 | Lightweight signaling demo |
-| **Binary Semaphore** | ✅ Đã dùng | 1 | BLE device detection signaling |
+| **Queue** | ✅ Đã dùng | 2 | UI queue (8 items), Speaker queue (1 item) |
 
 ---
 
-## 6. KHUYẾN NGHỊ
+## 7. KHUYẾN NGHỊ
 
-### Đã thêm:
+### Đã sử dụng:
 1. ✅ **Event Group**: Synchronize system initialization (tất cả components ready)
 2. ✅ **Task Notification**: Demo task sử dụng notification cho lightweight signaling
-3. ✅ **Binary Semaphore**: Signal khi có BLE device mới được phát hiện
+3. ✅ **Binary Semaphore**: 2 semaphores (device detection, button poll signaling)
+4. ✅ **FreeRTOS Software Timer**: 3 timers (button polling, BLE scan check, speaker alert throttle)
+5. ✅ **Mutex**: 6 mutexes bảo vệ tất cả shared data
+6. ✅ **Queue**: 2 queues cho inter-task communication
 
 ### Không cần thiết (hiện tại):
-- FreeRTOS Software Timer: `esp_timer` đã đủ tốt
-- Counting Semaphore: Không có use case rõ ràng trong project hiện tại
+- **Counting Semaphore**: Không có use case rõ ràng trong project hiện tại
+  - Có thể dùng cho resource pool nếu cần giới hạn số lượng BLE connections đồng thời
 
 ---
 
-## 7. CODE QUALITY
+## 8. CODE QUALITY
 
-### Điểm mạnh:
-- ✅ Tất cả shared data đã được bảo vệ bằng mutex
+### Điểm mạnh về thread safety:
+- ✅ Tất cả shared data đã được bảo vệ bằng mutex (6 mutexes)
 - ✅ Thread-safe operations được implement đúng cách
 - ✅ Sử dụng ESP-IDF timer hợp lý cho deferred operations
-
-### Đã cải thiện:
-- ✅ Đã thêm Event Group để synchronize system startup
-- ✅ Đã thêm Task Notification demo cho lightweight signaling
-- ✅ Đã thêm Binary Semaphore cho device detection signaling
+- ✅ Alert throttling với timer và mutex để tránh spam
+- ✅ Priority queue với mutex để xử lý alerts theo thứ tự ưu tiên
+- ✅ ISR-safe signaling với binary semaphore từ timer callback
 
 ---
 
