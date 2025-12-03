@@ -258,34 +258,9 @@ s_priority_queue_mutex = xSemaphoreCreateMutex();
 
 **Đánh giá**: ✅ Tốt - Đã bảo vệ tất cả shared data với mutex, bao gồm cả alert throttling và priority queue.
 
-### Binary Semaphore - **ĐÃ SỬ DỤNG** (2 semaphores)
+### Binary Semaphore - **ĐÃ SỬ DỤNG** (1 semaphore)
 
-#### Binary Semaphore 1: Device Detected Semaphore
-**Vị trí**: `components/ble_scanner/ble_scanner.c`
-
-**Mục đích**: Signal khi có BLE device mới được phát hiện
-
-**Code**:
-```c
-// Create binary semaphore
-static SemaphoreHandle_t device_detected_sem = NULL;
-
-void ble_scanner_init(void) {
-    device_detected_sem = xSemaphoreCreateBinary();
-}
-
-// Signal when device detected
-if (device_detected_sem != NULL) {
-    xSemaphoreGive(device_detected_sem);
-}
-
-// Get semaphore for other tasks
-SemaphoreHandle_t ble_scanner_get_device_detected_sem(void);
-```
-
-**Đánh giá**: ✅ Tốt - Lightweight signaling mechanism cho device detection events.
-
-#### Binary Semaphore 2: Button Poll Semaphore
+#### Binary Semaphore: Button Poll Semaphore
 **Vị trí**: `components/button/button.c`
 
 **Mục đích**: Signal từ timer callback để wake up button task (thay vì dùng vTaskDelay)
@@ -487,7 +462,7 @@ xQueueReceive(speaker_queue, &sensor_data, portMAX_DELAY);
 | **ESP-IDF Timer** | ✅ Đã dùng | 1 | Deferred NVS save (800ms) |
 | **FreeRTOS Software Timer** | ✅ Đã dùng | 3 | Button polling (5ms), BLE scan check (30s), Speaker alert throttle (8s) |
 | **Mutex** | ✅ Đã dùng | 6 | Config, NVS, Sensor Data, Alert, Audio, Priority Queue |
-| **Binary Semaphore** | ✅ Đã dùng | 2 | Device detected, Button poll signaling |
+| **Binary Semaphore** | ✅ Đã dùng | 1 | Button poll signaling |
 | **Counting Semaphore** | ❌ Chưa dùng | 0 | Có thể dùng cho resource pool |
 | **Event Group** | ✅ Đã dùng | 1 | System initialization sync (5 bits) |
 | **Task Notification** | ✅ Đã dùng | 1 | Lightweight signaling demo |
@@ -500,7 +475,7 @@ xQueueReceive(speaker_queue, &sensor_data, portMAX_DELAY);
 ### Đã sử dụng:
 1. ✅ **Event Group**: Synchronize system initialization (tất cả components ready)
 2. ✅ **Task Notification**: Demo task sử dụng notification cho lightweight signaling
-3. ✅ **Binary Semaphore**: 2 semaphores (device detection, button poll signaling)
+3. ✅ **Binary Semaphore**: 1 semaphore (button poll signaling)
 4. ✅ **FreeRTOS Software Timer**: 3 timers (button polling, BLE scan check, speaker alert throttle)
 5. ✅ **Mutex**: 6 mutexes bảo vệ tất cả shared data
 6. ✅ **Queue**: 2 queues cho inter-task communication

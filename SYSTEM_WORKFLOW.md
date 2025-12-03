@@ -107,10 +107,7 @@ Tài liệu này mô tả từng bước hoạt động của hệ thống, bao 
 - **Bước 4.1.1**: Tạo Sensor Data Mutex
   - **FreeRTOS**: ✅ **Mutex** - `xSemaphoreCreateMutex()` → `sensor_data_mutex`
   - **Mục đích**: Bảo vệ global sensor variables (front_left_*, front_right_*, rear_left_*, rear_right_*)
-- **Bước 4.1.2**: Tạo Device Detected Binary Semaphore
-  - **FreeRTOS**: ✅ **Binary Semaphore** - `xSemaphoreCreateBinary()` → `device_detected_sem`
-  - **Mục đích**: Signal khi có BLE device mới được phát hiện
-- **Bước 4.1.3**: Tạo Alert Mutex
+- **Bước 4.1.2**: Tạo Alert Mutex
   - **FreeRTOS**: ✅ **Mutex** - `xSemaphoreCreateMutex()` → `s_alert_mutex`
   - **Mục đích**: Bảo vệ `s_pending_alert` buffer cho alert throttling
 - **Bước 4.1.4**: Tạo Speaker Alert Throttling Timer
@@ -220,19 +217,17 @@ Tài liệu này mô tả từng bước hoạt động của hệ thống, bao 
 - **Bước 8.1.7**: Lookup device bằng địa chỉ BLE (TT/TP/ST/SP)
 - **Bước 8.1.8**: Gọi `speaker_notify_sensor_detected()`
   - **FreeRTOS**: ✅ **Event Group** - `xEventGroupSetBits(s_sensor_event_group, bit)` - Set bit tương ứng với sensor
-- **Bước 8.1.9**: Signal Device Detected Binary Semaphore
-  - **FreeRTOS**: ✅ **Binary Semaphore** - `xSemaphoreGive(device_detected_sem)`
-- **Bước 8.1.10**: Kiểm tra áp suất bất thường (HIGH/LOW threshold)
-- **Bước 8.1.11**: Nếu áp suất bất thường → Gửi vào speaker_queue
+- **Bước 8.1.9**: Kiểm tra áp suất bất thường (HIGH/LOW threshold)
+- **Bước 8.1.10**: Nếu áp suất bất thường → Gửi vào speaker_queue
   - **FreeRTOS**: ✅ **Queue** - `xQueueSend(s_speaker_queue, &sensor_data, 0)` - Non-blocking
-- **Bước 8.1.12**: Lock Sensor Data Mutex
+- **Bước 8.1.11**: Lock Sensor Data Mutex
   - **FreeRTOS**: ✅ **Mutex** - `xSemaphoreTake(sensor_data_mutex, portMAX_DELAY)`
-- **Bước 8.1.13**: Cập nhật global sensor variables theo device_name:
+- **Bước 8.1.12**: Cập nhật global sensor variables theo device_name:
   - TT → `front_left_*`
   - TP → `front_right_*`
   - ST → `rear_left_*`
   - SP → `rear_right_*`
-- **Bước 8.1.14**: Unlock Sensor Data Mutex
+- **Bước 8.1.13**: Unlock Sensor Data Mutex
   - **FreeRTOS**: ✅ **Mutex** - `xSemaphoreGive(sensor_data_mutex)`
 
 ### BLE Scan Status Check Timer Callback (mỗi 30 giây):
@@ -510,8 +505,7 @@ Tài liệu này mô tả từng bước hoạt động của hệ thống, bao 
 - `s_audio_mutex` - Bảo vệ UART operations
 - `s_priority_queue_mutex` - Bảo vệ priority queue
 
-### 4. **Binary Semaphore** (2 semaphores):
-- `device_detected_sem` - Signal khi có BLE device mới
+### 4. **Binary Semaphore** (1 semaphore):
 - `s_button_poll_sem` - Signal từ timer callback để wake up button task
 
 ### 5. **Event Group** (2 event groups):

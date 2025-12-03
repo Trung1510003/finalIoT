@@ -69,9 +69,6 @@ static SemaphoreHandle_t s_alert_mutex = NULL;
 // Mutex for protecting global sensor data variables
 static SemaphoreHandle_t sensor_data_mutex = NULL;
 
-// Binary semaphore for signaling new device detection
-static SemaphoreHandle_t device_detected_sem = NULL;
-
 // Timer for BLE scan status check/restart (optional periodic check)
 static TimerHandle_t s_ble_scan_timer = NULL;
 #define BLE_SCAN_CHECK_INTERVAL_MS 30000  // Check every 30 seconds
@@ -282,12 +279,6 @@ static int host_rcv_pkt(uint8_t *data, uint16_t len) {
                             // Notify speaker component that this sensor was detected
                             // This will set the corresponding bit in Event Group
                             speaker_notify_sensor_detected(sensor_data.device_name);
-                            
-                            // Signal binary semaphore for new device detection
-                            // Note: This is called from HCI callback (task context, not ISR)
-                            if (device_detected_sem != NULL) {
-                                xSemaphoreGive(device_detected_sem);
-                            }
 
                     // Pressure checking with configurable thresholds
                     bool pressure_abnormal = false;
@@ -417,13 +408,6 @@ void ble_scanner_init(void) {
         ESP_LOGE(TAG, "Failed to create sensor data mutex");
         return;
     }
-    
-    // Create binary semaphore for device detection signaling
-    device_detected_sem = xSemaphoreCreateBinary();
-    if (device_detected_sem == NULL) {
-        ESP_LOGE(TAG, "Failed to create device detected semaphore");
-        return;
-    }
 
     // Create mutex for alert throttling
     s_alert_mutex = xSemaphoreCreateMutex();
@@ -519,8 +503,3 @@ void ble_scanner_unlock_sensor_data(void) {
         xSemaphoreGive(sensor_data_mutex);
     }
 }
-
-SemaphoreHandle_t ble_scanner_get_device_detected_sem(void) {
-    return device_detected_sem;
-}
-

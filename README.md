@@ -89,7 +89,6 @@ void tpms_config_unlock(void);
 - Parse packet BLE và trích xuất dữ liệu cảm biến
 - Cập nhật biến global cho 4 lốp (Front Left, Front Right, Rear Left, Rear Right)
 - Gửi cảnh báo vào speaker queue khi áp suất/nhiệt độ vượt ngưỡng
-- Signal binary semaphore khi phát hiện thiết bị mới
 
 **API chính**:
 ```c
@@ -97,7 +96,6 @@ void ble_scanner_init(void);
 void ble_scanner_start(QueueHandle_t speaker_queue, EventGroupHandle_t event_group);
 void ble_scanner_lock_sensor_data(void);
 void ble_scanner_unlock_sensor_data(void);
-SemaphoreHandle_t ble_scanner_get_device_detected_sem(void);
 ```
 
 **Dữ liệu cảm biến** (global variables):
@@ -110,7 +108,6 @@ SemaphoreHandle_t ble_scanner_get_device_detected_sem(void);
 
 **FreeRTOS Features**:
 - FreeRTOS Software Timer: Kiểm tra trạng thái BLE scan định kỳ (30 giây)
-- Binary Semaphore: Signal khi phát hiện thiết bị mới
 
 ---
 
@@ -247,7 +244,7 @@ void button_task_start(QueueHandle_t ui_queue, EventGroupHandle_t event_group);
 | **ESP-IDF Timer** | 1 | `tpms_config` | Deferred save config vào NVS |
 | **FreeRTOS Software Timer** | 2 | `button`, `ble_scanner` | Button polling (5ms), BLE scan check (30s) |
 | **Mutex** | 3 | `tpms_config`, `ble_scanner` | Bảo vệ config, NVS operations, sensor data |
-| **Binary Semaphore** | 1 | `ble_scanner` | Signal khi phát hiện BLE device mới |
+| **Binary Semaphore** | 1 | `button` | Timer → wake up button task |
 | **Event Group** | 1 | `main` | Synchronize system initialization |
 | **Task Notification** | 1 | `main`, `screen` | Lightweight signaling demo |
 | **Queue** | 2 | `main` | UI queue (8 items), Speaker queue (1 item) |
@@ -269,8 +266,7 @@ void button_task_start(QueueHandle_t ui_queue, EventGroupHandle_t event_group);
 - **Sensor Data Mutex**: Bảo vệ global sensor variables
 
 #### 4. Binary Semaphore
-- **Device Detected Semaphore**: Signal khi có BLE device mới được phát hiện
-- Các task khác có thể wait trên semaphore này để được thông báo
+- **Button Poll Semaphore**: Signal từ timer callback để wake up button task (ISR-safe)
 
 #### 5. Event Group
 - **System Ready Events**: Synchronize initialization của tất cả components

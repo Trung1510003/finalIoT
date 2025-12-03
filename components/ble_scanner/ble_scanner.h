@@ -48,10 +48,6 @@ void ble_scanner_start(QueueHandle_t speaker_queue, EventGroupHandle_t event_gro
 void ble_scanner_lock_sensor_data(void);
 void ble_scanner_unlock_sensor_data(void);
 
-// Get binary semaphore for new device detection notification
-// Returns NULL if not initialized
-SemaphoreHandle_t ble_scanner_get_device_detected_sem(void);
-
 #ifdef __cplusplus
 }
 #endif

@@ -145,13 +145,7 @@ void app_main(void) {
     } else {
         ESP_LOGW(TAG, "Screen task handle not available, skipping notification demo");
     }
-    
-    // Example: Demonstrate binary semaphore usage
-    SemaphoreHandle_t device_sem = ble_scanner_get_device_detected_sem();
-    if (device_sem != NULL) {
-        ESP_LOGI(TAG, "Binary semaphore available for device detection signaling");
-        // In a real application, another task could wait on this semaphore
-        // to be notified when a new BLE device is detected
-    }
+    // Note: BLE scanner exposes sensor data via globals protected by a mutex.
+    // If needed, additional signaling (e.g. semaphores) can be added later.
 }
 
