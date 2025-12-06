@@ -46,4 +46,3 @@ TaskHandle_t screen_get_task_handle(void);
 #endif
 
 #endif // SCREEN_H
-

@@ -38,4 +38,3 @@ void button_task_start(QueueHandle_t ui_queue, EventGroupHandle_t event_group);
 #endif
 
 #endif // BUTTON_H
-

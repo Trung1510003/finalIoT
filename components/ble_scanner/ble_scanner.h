@@ -53,4 +53,3 @@ void ble_scanner_unlock_sensor_data(void);
 #endif
 
 #endif // BLE_SCANNER_H
-

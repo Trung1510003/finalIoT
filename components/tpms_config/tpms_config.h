@@ -95,4 +95,3 @@ static inline float tpms_convert_unit_to_psi(float value, unit_pressure_t unit) 
 #endif
 
 #endif // TPMS_CONFIG_H
-

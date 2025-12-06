@@ -19,11 +19,8 @@ static SemaphoreHandle_t s_button_poll_sem = NULL;
 
 // Timer callback for button polling (runs in timer task context)
 static void button_poll_timer_callback(TimerHandle_t xTimer) {
-    // Give semaphore to wake up button task
-    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
     if (s_button_poll_sem != NULL) {
-        xSemaphoreGiveFromISR(s_button_poll_sem, &xHigherPriorityTaskWoken);
-        portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+        xSemaphoreGive(s_button_poll_sem);
     }
 }
 
@@ -473,4 +470,3 @@ void button_task_start(QueueHandle_t ui_queue, EventGroupHandle_t event_group) {
     
     xTaskCreate(input_task, "input_task", 3072, NULL, 3, NULL);
 }
-

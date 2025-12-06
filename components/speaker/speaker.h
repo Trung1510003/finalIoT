@@ -49,4 +49,3 @@ void speaker_set_voice_enabled(bool enabled);
 #endif
 
 #endif // SPEAKER_H
-

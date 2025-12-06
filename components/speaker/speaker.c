@@ -566,4 +566,3 @@ void speaker_task_start(QueueHandle_t queue, EventGroupHandle_t event_group)
         xEventGroupSetBits(event_group, BIT_SPEAKER_READY);
     }
 }
-

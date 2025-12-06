@@ -2,7 +2,7 @@
 
 Hệ thống giám sát cảm biến áp suất lốp (TPMS) sử dụng ESP32, hiển thị thông tin trên màn hình OLED và phát cảnh báo qua loa DFPlayer.
 
-## 📋 Tổng quan
+## Tổng quan
 
 Project này là một hệ thống giám sát TPMS (Tire Pressure Monitoring System) hoàn chỉnh với các tính năng:
 
@@ -12,38 +12,7 @@ Project này là một hệ thống giám sát TPMS (Tire Pressure Monitoring Sy
 - **Configuration Management**: Lưu trữ cấu hình vào NVS (Non-Volatile Storage)
 - **User Interface**: Menu điều hướng với 3 nút bấm (UP, MODE, DOWN)
 
-## 🏗️ Kiến trúc hệ thống
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                        app_main()                           │
-│  - Initialize NVS                                          │
-│  - Create Event Group (system synchronization)             │
-│  - Initialize all components                               │
-│  - Wait for all components ready                           │
-└─────────────────────────────────────────────────────────────┘
-                            │
-        ┌───────────────────┼───────────────────┐
-        │                   │                   │
-        ▼                   ▼                   ▼
-┌──────────────┐    ┌──────────────┐    ┌──────────────┐
-│  BLE Scanner │    │   Speaker    │    │    Screen    │
-│    Task      │───▶│    Task      │    │    Task      │
-└──────────────┘    └──────────────┘    └──────────────┘
-        │                   │                   │
-        │                   │                   │
-        ▼                   ▼                   ▼
-┌──────────────┐    ┌──────────────┐    ┌──────────────┐
-│  Sensor Data │    │ Speaker Queue│    │   UI Queue   │
-│  (globals)   │    │  (alerts)    │    │  (updates)   │
-└──────────────┘    └──────────────┘    └──────────────┘
-        │                                       ▲
-        │                                       │
-        └───────────────────────────────────────┘
-                    Button Task
-```
-
-## 📦 Components
+## Components
 
 ### 1. `tpms_config` - Configuration Management
 
@@ -105,9 +74,6 @@ void ble_scanner_unlock_sensor_data(void);
 - `rear_right_pressure_psi`, `rear_right_temperature`, `rear_right_voltage`
 
 **Thread Safety**: Sử dụng `sensor_data_mutex` để bảo vệ khi đọc dữ liệu từ các task khác.
-
-**FreeRTOS Features**:
-- FreeRTOS Software Timer: Kiểm tra trạng thái BLE scan định kỳ (30 giây)
 
 ---
 
@@ -198,9 +164,6 @@ typedef struct {
 
 **Thread Safety**: Sử dụng lock (`ble_scanner_lock_sensor_data()`, `tpms_config_lock()`) khi đọc dữ liệu từ các component khác.
 
-**FreeRTOS Features**:
-- Task Notification: Nhận notification từ các task khác (demo)
-
 ---
 
 ### 5. `button` - Button Input Handler
@@ -228,246 +191,10 @@ void button_task_start(QueueHandle_t ui_queue, EventGroupHandle_t event_group);
 - Debounce: 30ms
 - Hold threshold: 450ms
 - Repeat: Bắt đầu sau 120ms, tăng tốc sau 20ms, tối thiểu 60ms
-- Long press MODE: 2000ms (toggle mirror mode)
+- Long press MODE: 2000ms (quay về màn hình HELLO)
+- Long press DOWN: 2000ms (toggle mirror mode)
 
 **FreeRTOS Features**:
-- FreeRTOS Software Timer: Poll buttons mỗi 5ms thay vì dùng vTaskDelay
+- FreeRTOS Software Timer: Poll buttons mỗi 10ms thay vì dùng vTaskDelay
 
 ---
-
-## 🔧 FreeRTOS/ESP-IDF Features
-
-### ✅ Đã sử dụng
-
-| Tính năng | Số lượng | Vị trí | Mục đích |
-|-----------|----------|--------|----------|
-| **ESP-IDF Timer** | 1 | `tpms_config` | Deferred save config vào NVS |
-| **FreeRTOS Software Timer** | 2 | `button`, `ble_scanner` | Button polling (5ms), BLE scan check (30s) |
-| **Mutex** | 3 | `tpms_config`, `ble_scanner` | Bảo vệ config, NVS operations, sensor data |
-| **Binary Semaphore** | 1 | `button` | Timer → wake up button task |
-| **Event Group** | 1 | `main` | Synchronize system initialization |
-| **Task Notification** | 1 | `main`, `screen` | Lightweight signaling demo |
-| **Queue** | 2 | `main` | UI queue (8 items), Speaker queue (1 item) |
-
-### 📝 Chi tiết
-
-#### 1. ESP-IDF Timer (`esp_timer`)
-- **Vị trí**: `components/tpms_config/tpms_config.c`
-- **Mục đích**: Deferred save configuration vào NVS
-- **Cách hoạt động**: Khi config thay đổi, schedule save sau 800ms để tránh ghi flash quá thường xuyên
-
-#### 2. FreeRTOS Software Timer
-- **Button Polling Timer**: Poll buttons mỗi 5ms, chính xác hơn vTaskDelay
-- **BLE Scan Check Timer**: Kiểm tra trạng thái BLE scan mỗi 30 giây
-
-#### 3. Mutex
-- **Config Mutex**: Bảo vệ `g_tpms_config` khi đọc/ghi từ nhiều tasks
-- **NVS Mutex**: Serialize các thao tác NVS (read/write)
-- **Sensor Data Mutex**: Bảo vệ global sensor variables
-
-#### 4. Binary Semaphore
-- **Button Poll Semaphore**: Signal từ timer callback để wake up button task (ISR-safe)
-
-#### 5. Event Group
-- **System Ready Events**: Synchronize initialization của tất cả components
-- **Bits**: `BIT_CONFIG_READY`, `BIT_SPEAKER_READY`, `BIT_BLE_READY`, `BIT_SCREEN_READY`, `BIT_BUTTON_READY`
-- Main task chờ tất cả bits được set trước khi tiếp tục
-
-#### 6. Task Notification
-- **Demo**: Lightweight alternative cho queue khi chỉ cần signal, không cần data
-- Nhanh hơn queue cho simple notifications
-
----
-
-## 🚀 Build & Flash
-
-### Yêu cầu
-
-- ESP-IDF v5.0 trở lên
-- Python 3.8+
-- CMake 3.16+
-
-### Các bước build
-
-```bash
-# Clone repository
-git clone <repository-url>
-cd SensorBLE_OLED
-
-# Setup ESP-IDF (nếu chưa setup)
-. $HOME/esp/esp-idf/export.sh
-
-# Configure project
-idf.py menuconfig
-
-# Build project
-idf.py build
-
-# Flash to ESP32
-idf.py -p PORT flash
-
-# Monitor serial output
-idf.py -p PORT monitor
-```
-
-### Cấu hình
-
-Chạy `idf.py menuconfig` để cấu hình:
-- Serial port
-- Flash size
-- Partition table
-- FreeRTOS settings
-
----
-
-## 📁 Cấu trúc thư mục
-
-```
-SensorBLE_OLED/
-├── main/
-│   ├── main.c              # Entry point, component initialization
-│   └── CMakeLists.txt
-├── components/
-│   ├── tpms_config/       # Configuration management
-│   │   ├── tpms_config.h
-│   │   ├── tpms_config.c
-│   │   └── CMakeLists.txt
-│   ├── ble_scanner/       # BLE sensor scanner
-│   │   ├── ble_scanner.h
-│   │   ├── ble_scanner.c
-│   │   ├── bt_hci_common.h
-│   │   ├── bt_hci_common.c
-│   │   └── CMakeLists.txt
-│   ├── speaker/           # Audio alert system
-│   │   ├── speaker.h
-│   │   ├── speaker.c
-│   │   └── CMakeLists.txt
-│   ├── screen/            # OLED display & UI
-│   │   ├── screen.h
-│   │   ├── screen.c
-│   │   └── CMakeLists.txt
-│   ├── button/            # Button input handler
-│   │   ├── button.h
-│   │   ├── button.c
-│   │   └── CMakeLists.txt
-│   ├── u8g2/              # U8G2 graphics library
-│   └── u8g2-hal-esp-idf/  # U8G2 ESP-IDF HAL
-├── CMakeLists.txt
-├── sdkconfig
-└── README.md
-```
-
----
-
-## 🔄 Luồng hoạt động
-
-### 1. Khởi động hệ thống
-
-```
-app_main()
-  ├─ Init NVS
-  ├─ Create Event Group
-  ├─ tpms_config_init() → Load config from NVS
-  ├─ speaker_init()
-  ├─ ble_scanner_init()
-  ├─ screen_init()
-  ├─ button_init()
-  ├─ Start all tasks (parallel)
-  └─ Wait for ALL_SYSTEM_READY
-```
-
-### 2. Runtime
-
-```
-BLE Scanner Task
-  ├─ Scan BLE devices
-  ├─ Parse sensor data
-  ├─ Update global variables (with mutex)
-  └─ Send alerts to speaker_queue (if abnormal)
-
-Speaker Task
-  ├─ Wait on speaker_queue
-  ├─ Play audio alert based on sensor data
-  └─ Use voice setting from config
-
-Screen Task
-  ├─ Wait on ui_queue (or timeout for blink)
-  ├─ Lock sensor data + config
-  ├─ Render HELLO/MENU/ITEM/ADJUST/SENSOR
-  └─ Unlock
-
-Button Task
-  ├─ Poll buttons (via timer)
-  ├─ Detect press/repeat/long press
-  └─ Send ui_update_t to ui_queue
-```
-
-### 3. Configuration Save
-
-```
-User changes config
-  └─ tpms_config_schedule_save(800ms)
-      └─ ESP-IDF timer starts
-          └─ After 800ms: save_timer_cb()
-              └─ Lock mutexes
-              └─ Save to NVS
-              └─ Unlock mutexes
-```
-
----
-
-## 📊 Menu System
-
-Hệ thống menu gồm 9 mục:
-
-1. **Warm-up greetings** - Bật/tắt lời chào khởi động
-2. **Warning settings** - Chọn giọng nam/nữ
-3. **Front tire pressure** - Cài đặt ngưỡng áp suất lốp trước
-4. **Rear tire pressure** - Cài đặt ngưỡng áp suất lốp sau
-5. **High temp warning** - Cài đặt ngưỡng cảnh báo nhiệt độ
-6. **Tire swap** - Chọn chế độ đổi lốp (Initial/Vertical/Cross/Horizontal)
-7. **Connect the sensor** - Xem và cấu hình địa chỉ BLE cảm biến
-8. **Unit pressure** - Chọn đơn vị PSI/BAR
-9. **Restore settings** - Khôi phục cài đặt mặc định
-
----
-
-## 🔒 Thread Safety
-
-Tất cả shared data đều được bảo vệ bằng mutex:
-
-- **Config data**: `tpms_config_lock()` / `tpms_config_unlock()`
-- **Sensor data**: `ble_scanner_lock_sensor_data()` / `ble_scanner_unlock_sensor_data()`
-- **NVS operations**: Serialized với `nvs_mutex`
-
-**Lưu ý**: Luôn sử dụng lock/unlock khi đọc/ghi shared data từ nhiều tasks.
-
----
-
-## 📝 Notes
-
-- **NVS**: Cấu hình được lưu tự động vào NVS sau 800ms khi thay đổi
-- **Blink**: Giá trị vượt ngưỡng sẽ nhấp nháy mỗi 500ms trên màn hình HELLO
-- **Mirror Mode**: Có thể đảo chiều màn hình qua menu hoặc phím tắt
-- **Tire Swap**: Hệ thống tự động map lại thiết bị khi đổi lốp
-
----
-
-## 📚 Tài liệu tham khảo
-
-- [ESP-IDF Programming Guide](https://docs.espressif.com/projects/esp-idf/en/latest/)
-- [FreeRTOS Documentation](https://www.freertos.org/Documentation/RTOS_book.html)
-- [U8G2 Graphics Library](https://github.com/olikraus/u8g2)
-
----
-
-## 👥 Contributors
-
-- Project structure và component refactoring
-- FreeRTOS features implementation
-- Thread-safe configuration management
-
----
-
-**Ngày cập nhật**: 2024
-

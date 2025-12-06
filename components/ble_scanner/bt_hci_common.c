@@ -44,4 +44,3 @@ uint16_t make_cmd_ble_set_scan_enable(uint8_t *buf, uint8_t enable, uint8_t filt
     buf[5] = filter_duplicates;
     return 6;
 }
-

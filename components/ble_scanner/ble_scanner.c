@@ -69,10 +69,6 @@ static SemaphoreHandle_t s_alert_mutex = NULL;
 // Mutex for protecting global sensor data variables
 static SemaphoreHandle_t sensor_data_mutex = NULL;
 
-// Timer for BLE scan status check/restart (optional periodic check)
-static TimerHandle_t s_ble_scan_timer = NULL;
-#define BLE_SCAN_CHECK_INTERVAL_MS 30000  // Check every 30 seconds
-
 static void speaker_alert_timer_callback(TimerHandle_t xTimer);
 static void schedule_speaker_alert(const sensor_data_t *sensor_data);
 
@@ -381,26 +377,6 @@ static void hci_cmd_send_ble_scan_start(void) {
     ESP_LOGI(TAG, "BLE Scanning started");
 }
 
-static void hci_evt_process(void *pvParameters) {
-    while (1) {
-        vTaskDelay(portMAX_DELAY);
-    }
-}
-
-// Timer callback for BLE scan status check (runs in timer task context)
-static void ble_scan_timer_callback(TimerHandle_t xTimer) {
-    // This timer can be used to:
-    // 1. Check scan status periodically
-    // 2. Restart scan if needed
-    // 3. Log scan statistics
-    
-    // Example: Log that scan is still active
-    ESP_LOGD(TAG, "BLE scan status check - scan is active");
-    
-    // Optional: Check if we need to restart scan
-    // (In a real scenario, you might want to restart if no devices found for a long time)
-}
-
 void ble_scanner_init(void) {
     // Create mutex for sensor data
     sensor_data_mutex = xSemaphoreCreateMutex();
@@ -431,21 +407,6 @@ void ble_scanner_init(void) {
         ESP_LOGI(TAG, "Speaker alert timer created (%d ms window)", SPEAKER_ALERT_INTERVAL_MS);
     }
     
-    // Create FreeRTOS software timer for BLE scan status check
-    s_ble_scan_timer = xTimerCreate(
-        "ble_scan_check",                      // Timer name
-        pdMS_TO_TICKS(BLE_SCAN_CHECK_INTERVAL_MS), // Period: 30 seconds
-        pdTRUE,                                // Auto-reload (periodic)
-        (void*)0,                              // Timer ID
-        ble_scan_timer_callback                // Callback function
-    );
-    
-    if (s_ble_scan_timer == NULL) {
-        ESP_LOGE(TAG, "Failed to create BLE scan timer");
-    } else {
-        ESP_LOGI(TAG, "BLE scan status check timer created (%d ms period)", BLE_SCAN_CHECK_INTERVAL_MS);
-    }
-    
     esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT));
     ESP_ERROR_CHECK(esp_bt_controller_init(&bt_cfg));
@@ -471,17 +432,6 @@ void ble_scanner_start(QueueHandle_t speaker_queue, EventGroupHandle_t event_gro
             case 3: hci_cmd_send_ble_scan_start(); break;
         }
         vTaskDelay(100 / portTICK_PERIOD_MS);
-    }
-
-    xTaskCreatePinnedToCore(hci_evt_process, "hci_evt_process", 2048, NULL, 6, NULL, 0);
-    
-    // Start BLE scan status check timer
-    if (s_ble_scan_timer != NULL) {
-        if (xTimerStart(s_ble_scan_timer, 0) != pdPASS) {
-            ESP_LOGE(TAG, "Failed to start BLE scan timer");
-        } else {
-            ESP_LOGI(TAG, "BLE scan status check timer started");
-        }
     }
     
     // Signal that BLE scanner is ready (after scan start)

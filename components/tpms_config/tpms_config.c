@@ -282,4 +282,3 @@ void tpms_config_restore_defaults(void) {
     tpms_config_update_devices_by_swap_mode(g_tpms_config.tire_swap);
     ESP_LOGI(TAG, "Settings restored to default and saved to NVS");
 }
-

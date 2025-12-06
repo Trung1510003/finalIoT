@@ -22,38 +22,6 @@ static const char *TAG = "MAIN";
 #define BIT_BUTTON_READY      (1 << 4)
 #define ALL_SYSTEM_READY      (BIT_CONFIG_READY | BIT_SPEAKER_READY | BIT_BLE_READY | BIT_SCREEN_READY | BIT_BUTTON_READY)
 
-// Task Notification bits (example usage)
-#define NOTIFY_SENSOR_UPDATE  (1UL << 0)
-#define NOTIFY_CONFIG_CHANGED (1UL << 1)
-
-// Example task using Task Notification (lightweight alternative to queue)
-static void notification_demo_task(void* pvParameters) {
-    TaskHandle_t screen_task = (TaskHandle_t)pvParameters;
-    TickType_t last_wake_time = xTaskGetTickCount();
-    
-    ESP_LOGI(TAG, "Notification demo task started");
-    
-    for (;;) {
-        // Wait for notification with timeout
-        uint32_t notification_value = ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(5000));
-        
-        if (notification_value != 0) {
-            ESP_LOGI(TAG, "Received notification: 0x%lx", notification_value);
-            
-            // Example: Notify screen task when sensor data is updated
-            if (screen_task != NULL && (notification_value & NOTIFY_SENSOR_UPDATE)) {
-                // Send notification to screen task (lightweight signal)
-                xTaskNotify(screen_task, NOTIFY_SENSOR_UPDATE, eSetBits);
-                ESP_LOGI(TAG, "Notified screen task about sensor update");
-            }
-        } else {
-            // Timeout - periodic check
-            ESP_LOGD(TAG, "Notification demo task: no notification received");
-        }
-        
-        vTaskDelayUntil(&last_wake_time, pdMS_TO_TICKS(10000)); // 10 second period
-    }
-}
 
 void app_main(void) {
     // Initialize NVS
@@ -135,17 +103,6 @@ void app_main(void) {
         ESP_LOGW(TAG, "⚠️ Some components may not be ready. Bits: 0x%x", bits);
     }
     
-    // Example: Start a demo task using Task Notification
-    // Get screen task handle for notification demo
-    TaskHandle_t screen_task_handle = screen_get_task_handle();
-    if (screen_task_handle != NULL) {
-        xTaskCreate(notification_demo_task, "notif_demo", 2048, 
-                   (void*)screen_task_handle, 1, NULL);
-        ESP_LOGI(TAG, "Task notification demo task started");
-    } else {
-        ESP_LOGW(TAG, "Screen task handle not available, skipping notification demo");
-    }
     // Note: BLE scanner exposes sensor data via globals protected by a mutex.
     // If needed, additional signaling (e.g. semaphores) can be added later.
 }
-
